@@ -499,15 +499,15 @@ async def JointheVC(VCchannel, TXchannel):
 
 	if VCchannel is not None:
 		if chkvoicechannel == 0:
-			voice_client1 = await VCchannel.connect()
+			voice_client1 = await VCchannel.connect(reconnect=True)
 			if voice_client1.is_connected():
 				await voice_client1.disconnect()
-				voice_client1 = await VCchannel.connect()
+				voice_client1 = await VCchannel.connect(reconnect=True)
 			chkvoicechannel = 1
 			await PlaySound(voice_client1, './sound/hello.mp3')
 		else :
 			await voice_client1.disconnect()
-			voice_client1 = await VCchannel.connect()
+			voice_client1 = await VCchannel.connect(reconnect=True)
 			await PlaySound(voice_client1, './sound/hello.mp3')
 		task1 = client.loop.create_task(my_background_task())
 	else:
