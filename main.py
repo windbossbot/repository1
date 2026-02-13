@@ -178,22 +178,7 @@ def fetch_kospi_daily() -> pd.DataFrame:
     if cached_df is not None:
         return cached_df
 
-    # 1) pykrx 우선 시도
-    try:
-        pykrx_stock = require_module("pykrx.stock", "optional: pip install pykrx")
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=365 * 15)).strftime("%Y%m%d")
-        df = pykrx_stock.get_index_ohlcv_by_date(start, end, "1001")
-        if not df.empty:
-            df = df.rename(columns={"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"})
-            df.index = pd.to_datetime(df.index)
-            use = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            _save_dataframe_cache(cache_name, use)
-            return use
-    except Exception:
-        pass
-
-    # 2) pykrx 불가 시 stooq 대체 (심볼 변형 순차 시도)
+    # KOSPI는 stooq CSV만 사용
     df = _fetch_stooq_with_fallback(["^kospi", "kospi", "^ks11"])
     _save_dataframe_cache(cache_name, df)
     return df
@@ -313,6 +298,17 @@ def classify_asset_trend(score: int) -> str:
         return "강세"
     if score == 3:
         return "강한 횡보"
+    if score == 2:
+        return "중립"
+    return "약세"
+
+
+def classify_asset_trend_label(asset_payload: dict[str, Any]) -> str:
+    if asset_payload.get("error"):
+        return "오류"
+    score = int(asset_payload.get("score", 0))
+    if score >= 3:
+        return "강세"
     if score == 2:
         return "중립"
     return "약세"
@@ -451,37 +447,35 @@ def _bear_transition_screener_on_df(symbol: str, df_daily: pd.DataFrame, is_stoc
     }
 
 
-def _get_krx_screen_universe(limit: int = 80) -> list[str]:
-    pykrx_stock = require_module("pykrx.stock", "pip install pykrx")
-    today = datetime.now().strftime("%Y%m%d")
-    market = pykrx_stock.get_market_cap_by_ticker(today)
-    if market.empty:
-        return []
-    market = market.sort_values("시가총액", ascending=False)
-    tickers = market.index.tolist()[: limit * 2]
-
-    out: list[str] = []
-    for t in tickers:
-        name = pykrx_stock.get_market_ticker_name(t)
-        lname = name.lower()
-        if any(x in lname for x in ["etf", "etn", "스팩", "우", "우b", "우선주"]):
-            continue
-        out.append(t)
-        if len(out) >= limit:
-            break
-    return out
+def _get_krx_stooq_universe(limit: int = 50) -> list[str]:
+    # stooq에서 비교적 조회가 쉬운 대표 KRX 티커 샘플
+    universe = [
+        "005930.kr",  # Samsung Electronics
+        "000660.kr",  # SK Hynix
+        "035420.kr",  # NAVER
+        "051910.kr",  # LG Chem
+        "207940.kr",  # Samsung Biologics
+        "068270.kr",  # Celltrion
+        "005380.kr",  # Hyundai Motor
+        "006400.kr",  # Samsung SDI
+        "035720.kr",  # Kakao
+        "105560.kr",  # KB Financial
+        "055550.kr",  # Shinhan Financial
+        "096770.kr",  # SK Innovation
+        "012330.kr",  # Hyundai Mobis
+        "028260.kr",  # Samsung C&T
+        "003670.kr",  # POSCO Future M
+        "323410.kr",  # KakaoBank
+        "086790.kr",  # Hana Financial
+        "015760.kr",  # Korea Electric Power
+        "034730.kr",  # SK
+        "010130.kr",  # Korea Zinc
+    ]
+    return universe[:limit]
 
 
 def _fetch_krx_ticker_daily(ticker: str, years: int = 3) -> pd.DataFrame:
-    pykrx_stock = require_module("pykrx.stock", "pip install pykrx")
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
-    df = pykrx_stock.get_market_ohlcv_by_date(start, end, ticker)
-    if df.empty:
-        return pd.DataFrame()
-    df = df.rename(columns={"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"})
-    df.index = pd.to_datetime(df.index)
-    return df[["Open", "High", "Low", "Close", "Volume"]]
+    return _fetch_stooq_daily(ticker, years=years)
 
 
 def run_screener(kind: str) -> dict[str, Any]:
@@ -491,28 +485,24 @@ def run_screener(kind: str) -> dict[str, Any]:
     if cached is not None:
         return cached
 
-    pykrx_stock = None
-    try:
-        pykrx_stock = require_module("pykrx.stock", "pip install pykrx")
-    except DataSourceError:
-        pass
-
     results: list[dict[str, Any]] = []
     failures: list[str] = []
 
-    try:
-        for ticker in _get_krx_screen_universe(limit=50):
+    # KRX stocks via stooq universe
+    for ticker in _get_krx_stooq_universe(limit=50):
+        try:
             df = _fetch_krx_ticker_daily(ticker)
             if df.empty:
                 continue
             row = _bull_screener_on_df(ticker, df, True) if kind == "bull" else _bear_transition_screener_on_df(ticker, df, True)
             if row:
                 row["asset_type"] = "KRX Stock"
-                row["name"] = pykrx_stock.get_market_ticker_name(ticker) if pykrx_stock else ticker
+                row["name"] = ticker
                 results.append(row)
-    except Exception as exc:
-        failures.append(f"KRX screener source failure: {exc}")
+        except Exception as exc:
+            failures.append(f"{ticker} screener source failure: {exc}")
 
+    # Crypto
     for sym in ["BTC/USD", "ETH/USD"]:
         try:
             df = fetch_crypto_daily(sym)
@@ -529,7 +519,7 @@ def run_screener(kind: str) -> dict[str, Any]:
         "count": len(results),
         "rows": sorted(results, key=lambda x: x["symbol"])[:100],
         "failures": failures,
-        "sources": ["pykrx or stooq (KOSPI)", "stooq (NASDAQ)", "ccxt/kraken→coinbase (Crypto)"],
+        "sources": ["stooq (KOSPI/KRX)", "stooq (NASDAQ)", "ccxt/kraken→coinbase (Crypto)"],
     }
     cache_set(cache_name, out, params)
     return out
@@ -546,6 +536,8 @@ def _demo_analysis_payload() -> dict[str, Any]:
     total = sum(v["score"] for v in assets.values())
     regime = "강세장" if total >= 8 else "전환기" if total >= 5 else "약세장"
     total_regime_label, total_summary = classify_total_regime(total, 16)
+    for v in assets.values():
+        v["trend_label"] = classify_asset_trend_label(v)
     asset_summaries = [build_asset_summary(k, v) for k, v in assets.items()]
     return {
         "total_score": total,
@@ -595,7 +587,7 @@ def analyze(demo: bool = False) -> JSONResponse:
         return JSONResponse(_demo_analysis_payload())
 
     assets = {
-        "KOSPI": (fetch_kospi_daily, "pykrx index 1001 or stooq (^KOSPI)"),
+        "KOSPI": (fetch_kospi_daily, "stooq (^KOSPI)"),
         "NASDAQ": (fetch_nasdaq_daily, "stooq CSV (^NDQ)"),
         "BTC": (lambda: fetch_crypto_daily("BTC/USD"), "ccxt/kraken→coinbase BTC/USD"),
         "ETH": (lambda: fetch_crypto_daily("ETH/USD"), "ccxt/kraken→coinbase ETH/USD"),
@@ -610,6 +602,7 @@ def analyze(demo: bool = False) -> JSONResponse:
             weekly = _to_weekly(fetcher())
             score = regime_score_from_weekly(weekly)
             score["source"] = source_name
+            score["trend_label"] = classify_asset_trend_label(score)
             per_asset[name] = score
             latest_dates.append(score["latest_week"])
         except Exception as exc:
@@ -624,6 +617,7 @@ def analyze(demo: bool = False) -> JSONResponse:
                 "latest_week": None,
                 "source": source_name,
                 "error": str(exc),
+                "trend_label": "오류",
             }
             failures.append(f"{name} source failure")
 
