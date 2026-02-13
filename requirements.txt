@@ -1,3 +1,14 @@
+fastapi
+uvicorn
+gunicorn
+jinja2
+pandas
+numpy
+requests
+pykrx
+pandas-datareader
+ccxt
+# existing project dependencies
 discord
 discord.py[voice]
 gtts
