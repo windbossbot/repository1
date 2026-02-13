@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>주식 코인 필터기</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; color: #222; }
+    h1 { margin: 0 0 8px 0; font-size: 1.4rem; }
+    button {
+      margin: 2px 0 6px 0; padding: 8px 14px; cursor: pointer; border: 1px solid #a9a9a9;
+      border-radius: 8px; background: #fff; position: relative; overflow: hidden;
+      transform: translateY(0) scale(1);
+      transition: transform 120ms ease, box-shadow 160ms ease, background-color 160ms ease;
+    }
+    button:hover { box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12); background-color: #fafafa; }
+    button:active { transform: translateY(1px) scale(0.97); }
+    button.pulse { animation: btnPulse 220ms ease; }
+    @keyframes btnPulse { 0% { transform: scale(0.97); } 60% { transform: scale(1.03); } 100% { transform: scale(1); } }
+    .ripple { position: absolute; border-radius: 999px; transform: scale(0); animation: ripple 450ms ease-out; background: rgba(33, 150, 243, 0.35); pointer-events: none; }
+    @keyframes ripple { to { transform: scale(5); opacity: 0; } }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+    .small { color: #555; font-size: 0.9rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #ddd; padding: 6px; font-size: 0.9rem; text-align: left; vertical-align: top; }
+    .ok { color: #0b7d20; font-weight: bold; }
+    .no { color: #999; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>주식 코인 필터기</h1>
+
+  <div class="card">
+    <button id="analyzeBtn">분석</button>
+    <div id="fearGreed" class="small">Fear & Greed: 아직 조회 전</div>
+  </div>
+
+  <div class="card">
+    <div id="regimeSummary">아직 분석 전</div>
+    <div id="overallSummary" class="small" style="margin-top:6px;"></div>
+    <div id="assetChecks"></div>
+    <div id="failures" class="error"></div>
+  </div>
+
+<script>
+const fmtNum = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '-' : Number(v).toLocaleString();
+
+function attachButtonMotion() {
+  document.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      btn.classList.remove('pulse');
+      void btn.offsetWidth;
+      btn.classList.add('pulse');
+      const rect = btn.getBoundingClientRect();
+      const ripple = document.createElement('span');
+      ripple.className = 'ripple';
+      const size = Math.max(rect.width, rect.height);
+      ripple.style.width = `${size}px`;
+      ripple.style.height = `${size}px`;
+      ripple.style.left = `${e.clientX - rect.left - size / 2}px`;
+      ripple.style.top = `${e.clientY - rect.top - size / 2}px`;
+      btn.appendChild(ripple);
+      ripple.addEventListener('animationend', () => ripple.remove());
+    });
+  });
+}
+
+async function loadAnalyze() {
+  try {
+    const res = await fetch('/api/analyze');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    document.getElementById('regimeSummary').innerHTML = `총점: <b>${data.total_score}/${data.max_score}</b> | 국면: <b>${data.regime}</b> | 최신 주봉: ${data.latest_week ?? '-'}`;
+    document.getElementById('overallSummary').textContent = data.summary_sentence || '';
+
+    const fear = data.fear_greed || {};
+    document.getElementById('fearGreed').innerHTML = `Fear & Greed: <b>${fear.value ?? '-'}</b> (${fear.classification ?? 'N/A'}) | ${fear.timestamp ?? '-'}<br/><span class="small">Source: ${fear.source ?? '-'}</span>${fear.error ? `<div class='error'>${fear.error}</div>` : ''}`;
+
+    const assets = data.assets || {};
+    const keys = ['close_ge_ma60w','close_ge_ma120w','close_break_20w_high','higher_high_recent_10w'];
+    const labels = { close_ge_ma60w:'Close >= MA60w', close_ge_ma120w:'Close >= MA120w', close_break_20w_high:'20주 고점 돌파', higher_high_recent_10w:'최근10주 HH' };
+
+    let html = '<table><thead><tr><th>자산</th><th>점수</th><th>체크</th><th>최신 주봉</th><th>소스</th><th>오류</th><th>평가</th></tr></thead><tbody>';
+    for (const [name, v] of Object.entries(assets)) {
+      const checks = keys.map(k => `<span class='${v.checks?.[k] ? 'ok':'no'}'>${v.checks?.[k] ? '✓':'✗'} ${labels[k]}</span>`).join('<br/>');
+      html += `<tr><td>${name}</td><td>${v.score}/4</td><td>${checks}</td><td>${v.latest_week ?? '-'}</td><td>${v.source ?? '-'}</td><td class='error'>${v.error ?? '-'}</td><td><b>${v.trend_label ?? '-'}</b></td></tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('assetChecks').innerHTML = html;
+    document.getElementById('failures').innerHTML = (data.failures || []).map(x => `• ${x}`).join('<br/>');
+  } catch (e) {
+    document.getElementById('failures').textContent = `분석 실패: ${e}`;
+  }
+}
+
+document.getElementById('analyzeBtn').addEventListener('click', loadAnalyze);
+attachButtonMotion();
+</script>
+</body>
+</html>
