@@ -43,3 +43,11 @@ uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 
 ## 참고
 - 스크리너 KRX 종목군은 실행 시간을 줄이기 위해 상위 시가총액 종목 일부를 대상으로 검사합니다.
+
+## Render 배포 시 참고
+- `gunicorn: command not found` 오류가 나면 `requirements.txt`에 `gunicorn`이 포함되어 있는지 확인하세요.
+- Procfile은 다음처럼 `web` 프로세스로 실행해야 합니다.
+
+```
+web: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT:-8000}
+```
