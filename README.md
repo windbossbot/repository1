@@ -55,4 +55,4 @@ web: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT:-8
 
 - `pykrx`는 선택사항이며, 설치되지 않아도 KOSPI는 stooq 대체 경로로 동작합니다.
 
-- pandas/pandas-datareader 호환 이슈 방지를 위해 requirements에 호환 버전을 고정했습니다.
+- pandas 버전은 Render에서 안정적으로 동작하는 버전으로 고정했습니다. (pandas-datareader 미사용)
