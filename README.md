@@ -15,8 +15,8 @@ FastAPI 기반 로컬 웹 앱입니다. **실시간 스트리밍 없이** 버튼
 
 ## 데이터 소스
 - KOSPI: `pykrx` 우선, 실패 시 stooq (`^KOSPI`) 대체
-- NASDAQ: stooq CSV 직접 조회 (`^NDQ`)
-- BTC/ETH: `ccxt` + Kraken (`BTC/USD`, `ETH/USD`)
+- NASDAQ: stooq CSV 직접 조회 (`^NDQ`, fallback 심볼 포함)
+- BTC/ETH: `ccxt` + Kraken 우선, 실패 시 Coinbase로 자동 fallback (`BTC/USD`, `ETH/USD`)
 - Fear & Greed: `https://api.alternative.me/fng/?limit=1`
 
 ## 실행
@@ -54,3 +54,5 @@ web: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT:-8
 ```
 
 - `pykrx`는 선택사항이며, 설치되지 않아도 KOSPI는 stooq 대체 경로로 동작합니다.
+
+- pandas/pandas-datareader 호환 이슈 방지를 위해 requirements에 호환 버전을 고정했습니다.

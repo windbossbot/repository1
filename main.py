@@ -138,6 +138,17 @@ def _save_dataframe_cache(cache_name: str, df: pd.DataFrame) -> None:
     cache_set(cache_name, out.to_dict(orient="records"))
 
 
+def _fetch_stooq_with_fallback(symbols: list[str], years: int = 15) -> pd.DataFrame:
+    last_exc: Exception | None = None
+    for sym in symbols:
+        try:
+            return _fetch_stooq_daily(sym, years=years)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise DataSourceError(f"stooq source failure (fallback exhausted): {last_exc}")
+
+
 def _fetch_stooq_daily(symbol: str, years: int = 15) -> pd.DataFrame:
     end = datetime.now()
     start = end - timedelta(days=365 * years)
@@ -182,8 +193,8 @@ def fetch_kospi_daily() -> pd.DataFrame:
     except Exception:
         pass
 
-    # 2) pykrx 불가 시 stooq 대체
-    df = _fetch_stooq_daily("^kospi")
+    # 2) pykrx 불가 시 stooq 대체 (심볼 변형 순차 시도)
+    df = _fetch_stooq_with_fallback(["^kospi", "kospi", "^ks11"])
     _save_dataframe_cache(cache_name, df)
     return df
 
@@ -195,9 +206,21 @@ def fetch_nasdaq_daily() -> pd.DataFrame:
         return cached_df
 
     # pandas-datareader 이슈(deprecate_kwarg) 회피를 위해 stooq CSV 직접 사용
-    df = _fetch_stooq_daily("^ndq")
+    df = _fetch_stooq_with_fallback(["^ndq", "ndq.us"])
     _save_dataframe_cache(cache_name, df)
     return df
+
+
+def fetch_crypto_daily(symbol: str) -> pd.DataFrame:
+    # 지역 제한 회피를 위해 Kraken 우선, 실패 시 Coinbase 순서로 시도
+    last_exc: Exception | None = None
+    for exchange_id in ["kraken", "coinbase"]:
+        try:
+            return fetch_exchange_daily(symbol, exchange_id=exchange_id)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise DataSourceError(f"crypto source failure ({symbol}): {last_exc}")
 
 
 def fetch_exchange_daily(symbol: str, exchange_id: str = "kraken") -> pd.DataFrame:
@@ -460,7 +483,7 @@ def run_screener(kind: str) -> dict[str, Any]:
 
     for sym in ["BTC/USD", "ETH/USD"]:
         try:
-            df = fetch_exchange_daily(sym, exchange_id="kraken")
+            df = fetch_crypto_daily(sym)
             row = _bull_screener_on_df(sym, df) if kind == "bull" else _bear_transition_screener_on_df(sym, df)
             if row:
                 row["asset_type"] = "Crypto"
@@ -474,7 +497,7 @@ def run_screener(kind: str) -> dict[str, Any]:
         "count": len(results),
         "rows": sorted(results, key=lambda x: x["symbol"])[:100],
         "failures": failures,
-        "sources": ["pykrx or stooq (KOSPI)", "stooq (NASDAQ)", "ccxt/kraken (Crypto)"],
+        "sources": ["pykrx or stooq (KOSPI)", "stooq (NASDAQ)", "ccxt/kraken→coinbase (Crypto)"],
     }
     cache_set(cache_name, out, params)
     return out
@@ -537,8 +560,8 @@ def analyze(demo: bool = False) -> JSONResponse:
     assets = {
         "KOSPI": (fetch_kospi_daily, "pykrx index 1001 or stooq (^KOSPI)"),
         "NASDAQ": (fetch_nasdaq_daily, "stooq CSV (^NDQ)"),
-        "BTC": (lambda: fetch_exchange_daily("BTC/USD", exchange_id="kraken"), "ccxt/kraken BTC/USD"),
-        "ETH": (lambda: fetch_exchange_daily("ETH/USD", exchange_id="kraken"), "ccxt/kraken ETH/USD"),
+        "BTC": (lambda: fetch_crypto_daily("BTC/USD"), "ccxt/kraken→coinbase BTC/USD"),
+        "ETH": (lambda: fetch_crypto_daily("ETH/USD"), "ccxt/kraken→coinbase ETH/USD"),
     }
 
     per_asset: dict[str, Any] = {}
