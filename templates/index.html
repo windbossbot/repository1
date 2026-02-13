@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Market Regime Analyzer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #222; }
+    h1 { margin-bottom: 8px; }
+    button {
+      margin: 4px 8px 8px 0;
+      padding: 8px 14px;
+      cursor: pointer;
+      border: 1px solid #a9a9a9;
+      border-radius: 8px;
+      background: #fff;
+      position: relative;
+      overflow: hidden;
+      transform: translateY(0) scale(1);
+      transition: transform 120ms ease, box-shadow 160ms ease, background-color 160ms ease;
+    }
+    button:hover { box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12); background-color: #fafafa; }
+    button:active { transform: translateY(1px) scale(0.97); }
+    button.pulse { animation: btnPulse 220ms ease; }
+    @keyframes btnPulse {
+      0% { transform: scale(0.97); }
+      60% { transform: scale(1.03); }
+      100% { transform: scale(1); }
+    }
+    .ripple {
+      position: absolute;
+      border-radius: 999px;
+      transform: scale(0);
+      animation: ripple 450ms ease-out;
+      background: rgba(33, 150, 243, 0.35);
+      pointer-events: none;
+    }
+    @keyframes ripple {
+      to { transform: scale(5); opacity: 0; }
+    }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .small { color: #555; font-size: 0.9rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #ddd; padding: 6px; font-size: 0.9rem; text-align: left; vertical-align: top; }
+    .ok { color: #0b7d20; font-weight: bold; }
+    .no { color: #999; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>1-Page Market Regime Analyzer</h1>
+  <p class="small">버튼 클릭 시에만 데이터 요청 (캐시 TTL: {{ ttl_hours }}시간)</p>
+
+  <div class="card">
+    <button id="analyzeBtn">분석</button>
+    <button id="demoAnalyzeBtn">데모 분석</button>
+    <span id="analyzeStatus" class="small">대기 중</span>
+    <div id="fearGreed" style="margin-top:8px;">Fear & Greed: 아직 조회 전</div>
+  </div>
+
+  <div class="card">
+    <h3>국면 결과</h3>
+    <div id="regimeSummary">아직 분석 전 (상단 [분석] 버튼을 누르세요)</div>
+    <div id="assetChecks"></div>
+    <div id="summarySentences" class="small" style="margin-top:10px;"></div>
+    <div id="failures" class="error"></div>
+  </div>
+
+  <div class="card">
+    <button id="bullBtn">강세장 스크리너</button>
+    <button id="bearBtn">전환·약세 스크리너</button>
+    <span id="screenStatus" class="small">대기 중</span>
+    <div id="screenResult">아직 실행 전</div>
+  </div>
+
+<script>
+const fmtNum = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '-' : Number(v).toLocaleString();
+
+function attachButtonMotion() {
+  document.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      btn.classList.remove('pulse');
+      void btn.offsetWidth;
+      btn.classList.add('pulse');
+
+      const rect = btn.getBoundingClientRect();
+      const ripple = document.createElement('span');
+      ripple.className = 'ripple';
+      const size = Math.max(rect.width, rect.height);
+      ripple.style.width = `${size}px`;
+      ripple.style.height = `${size}px`;
+      ripple.style.left = `${e.clientX - rect.left - size / 2}px`;
+      ripple.style.top = `${e.clientY - rect.top - size / 2}px`;
+      btn.appendChild(ripple);
+      ripple.addEventListener('animationend', () => ripple.remove());
+    });
+  });
+}
+
+async function checkServer() {
+  try {
+    const res = await fetch('/api/ping');
+    if (res.ok) {
+      document.getElementById('analyzeStatus').textContent = '서버 연결됨';
+      return;
+    }
+  } catch (_) {}
+  document.getElementById('analyzeStatus').textContent = '서버 연결 실패';
+}
+
+async function loadAnalyze(demo=false) {
+  const status = document.getElementById('analyzeStatus');
+  status.textContent = '불러오는 중...';
+  try {
+    const res = await fetch(demo ? '/api/analyze?demo=true' : '/api/analyze');
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    status.textContent = data.is_demo ? '완료 (데모)' : '완료';
+
+    document.getElementById('regimeSummary').innerHTML = `총점: <b>${data.total_score}/${data.max_score}</b> | 국면: <b>${data.regime}</b> | 최신 주봉: ${data.latest_week ?? '-'}`;
+
+    const fear = data.fear_greed || {};
+    document.getElementById('fearGreed').innerHTML = `Fear & Greed: <b>${fear.value ?? '-'}</b> (${fear.classification ?? 'N/A'}) | ${fear.timestamp ?? '-'}<br/><span class="small">Source: ${fear.source ?? '-'}</span>${fear.error ? `<div class='error'>${fear.error}</div>` : ''}`;
+
+    const assets = data.assets || {};
+    const keys = ['close_ge_ma60w','close_ge_ma120w','close_break_20w_high','higher_high_recent_10w'];
+    const labels = {
+      close_ge_ma60w:'Close >= MA60w',
+      close_ge_ma120w:'Close >= MA120w',
+      close_break_20w_high:'20주 고점 돌파',
+      higher_high_recent_10w:'최근10주 HH'
+    };
+
+    let html = '<table><thead><tr><th>자산</th><th>점수</th><th>체크</th><th>최신 주봉</th><th>소스</th><th>오류</th></tr></thead><tbody>';
+    for (const [name, v] of Object.entries(assets)) {
+      const checks = keys.map(k => `<span class='${v.checks?.[k] ? 'ok':'no'}'>${v.checks?.[k] ? '✓':'✗'} ${labels[k]}</span>`).join('<br/>');
+      html += `<tr><td>${name}</td><td>${v.score}/4</td><td>${checks}</td><td>${v.latest_week ?? '-'}</td><td>${v.source ?? '-'}</td><td class='error'>${v.error ?? '-'}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('assetChecks').innerHTML = html;
+
+    const summaryLines = [];
+    if (data.summary_sentence) {
+      summaryLines.push(`• ${data.summary_sentence}`);
+    }
+    for (const line of (data.asset_summary_sentences || [])) {
+      summaryLines.push(`• ${line}`);
+    }
+    document.getElementById('summarySentences').innerHTML = summaryLines.join('<br/>');
+
+    document.getElementById('failures').innerHTML = (data.failures || []).length
+      ? (data.failures || []).map(x => `• ${x}`).join('<br/>')
+      : '';
+  } catch (e) {
+    status.textContent = '실패';
+    document.getElementById('failures').textContent = `분석 실패: ${e}`;
+  }
+}
+
+function renderScreenResult(data) {
+  const rows = data.rows || [];
+  let html = `<div>결과 ${data.count}건 | Source: ${(data.sources || []).join(', ')}</div>`;
+  html += '<table><thead><tr><th>Symbol</th><th>Name</th><th>Type</th><th>Price</th><th>20D 이격%</th><th>120D 이격%</th><th>52주 고점 대비%</th><th>5일 평균 거래대금</th></tr></thead><tbody>';
+  for (const r of rows) {
+    html += `<tr><td>${r.symbol}</td><td>${r.name || '-'}</td><td>${r.asset_type || '-'}</td><td>${fmtNum(r.price)}</td><td>${fmtNum(r.dist_ma20_pct)}</td><td>${fmtNum(r.dist_ma120_pct)}</td><td>${fmtNum(r.from_52w_high_pct)}</td><td>${fmtNum(r.avg_value_5d)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  if ((data.failures || []).length) {
+    html += `<div class='error' style='margin-top:8px;'>${data.failures.map(x => '• ' + x).join('<br/>')}</div>`;
+  }
+  document.getElementById('screenResult').innerHTML = html;
+}
+
+async function loadScreener(kind) {
+  const status = document.getElementById('screenStatus');
+  status.textContent = '스크리너 실행 중...';
+  try {
+    const res = await fetch(`/api/screener/${kind}`);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    status.textContent = data.is_demo ? '완료 (데모)' : '완료';
+    renderScreenResult(data);
+  } catch (e) {
+    status.textContent = '실패';
+    document.getElementById('screenResult').innerHTML = `<div class='error'>스크리너 실패: ${e}</div>`;
+  }
+}
+
+document.getElementById('analyzeBtn').addEventListener('click', () => loadAnalyze(false));
+document.getElementById('demoAnalyzeBtn').addEventListener('click', () => loadAnalyze(true));
+document.getElementById('bullBtn').addEventListener('click', () => loadScreener('bull'));
+document.getElementById('bearBtn').addEventListener('click', () => loadScreener('bear'));
+attachButtonMotion();
+checkServer();
+</script>
+</body>
+</html>
