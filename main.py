@@ -552,25 +552,36 @@ def _get_krx_stooq_universe(limit: int = 50) -> list[str]:
 
 
 def _fetch_krx_ticker_daily(ticker: str, years: int = 3) -> pd.DataFrame:
-    return _fetch_stooq_daily(ticker, years=years)
+    yf = require_module("yfinance", "pip install yfinance")
+    end = datetime.now()
+    start = end - timedelta(days=365 * years)
+    try:
+        df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), auto_adjust=False, progress=False)
+    except Exception as exc:
+        raise DataSourceError(f"yfinance source failure ({ticker}): {exc}") from exc
+    if df is None or df.empty:
+        raise DataSourceError(f"yfinance source failure ({ticker}): empty data")
+
+    # yfinance 컬럼 표준화
+    cols = {str(c).split(" ")[0]: c for c in df.columns}
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(k in cols for k in needed):
+        raise DataSourceError(f"yfinance source failure ({ticker}): missing OHLCV columns")
+    out = df[[cols[k] for k in needed]].copy()
+    out.columns = needed
+    out.index = pd.to_datetime(out.index).tz_localize(None) if getattr(out.index, "tz", None) is not None else pd.to_datetime(out.index)
+    return out
 
 
-def _collect_screener_candidates(kind: str) -> tuple[list[dict[str, Any]], list[str]]:
+def _collect_bull_candidates() -> tuple[list[dict[str, Any]], list[str]]:
     results: list[dict[str, Any]] = []
     failures: list[str] = []
 
-    # KRX stocks via stooq universe
     krx_fail_count = 0
     for ticker in _get_krx_stooq_universe(limit=50):
         try:
             df = _fetch_krx_ticker_daily(ticker)
-            if df.empty:
-                krx_fail_count += 1
-                continue
-            if kind == "bull":
-                row = _bull_screener_on_df(ticker, df, True)
-            else:
-                row = _bear_transition_screener_on_df(ticker, df, True)
+            row = _bull_screener_on_df(ticker, df, True)
             if row:
                 row["asset_type"] = "KRX Stock"
                 row["name"] = ticker
@@ -580,16 +591,47 @@ def _collect_screener_candidates(kind: str) -> tuple[list[dict[str, Any]], list[
             krx_fail_count += 1
 
     if krx_fail_count > 0:
-        failures.append(f"KRX 데이터 실패: {krx_fail_count}개 스킵")
+        failures.append(f"KRX 실패: {krx_fail_count}개 스킵")
 
-    # Crypto
     for sym in ["BTC/USD", "ETH/USD"]:
         try:
             df = fetch_crypto_daily(sym)
-            if kind == "bull":
-                row = _bull_screener_on_df(sym, df)
-            else:
-                row = _bear_transition_screener_on_df(sym, df)
+            row = _bull_screener_on_df(sym, df)
+            if row:
+                row["asset_type"] = "Crypto"
+                row["name"] = sym
+                row["price_currency"] = "USD"
+                results.append(row)
+        except Exception as exc:
+            failures.append(f"{sym} screener source failure: {exc}")
+
+    return results, failures
+
+
+def _collect_bear_candidates() -> tuple[list[dict[str, Any]], list[str]]:
+    results: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    krx_fail_count = 0
+    for ticker in _get_krx_stooq_universe(limit=50):
+        try:
+            df = _fetch_krx_ticker_daily(ticker)
+            row = _bear_transition_screener_on_df(ticker, df, True)
+            if row:
+                row["asset_type"] = "KRX Stock"
+                row["name"] = ticker
+                row["price_currency"] = "KRW"
+                results.append(row)
+        except Exception:
+            krx_fail_count += 1
+
+    if krx_fail_count > 0:
+        failures.append(f"KRX 실패: {krx_fail_count}개 스킵")
+
+    for sym in ["BTC/USD", "ETH/USD"]:
+        try:
+            df = fetch_crypto_daily(sym)
+            row = _bear_transition_screener_on_df(sym, df)
             if row:
                 row["asset_type"] = "Crypto"
                 row["name"] = sym
@@ -628,7 +670,7 @@ def run_bull_screener() -> dict[str, Any]:
     cached = cache_get(cache_name)
     if cached is not None:
         return cached
-    rows, failures = _collect_screener_candidates("bull")
+    rows, failures = _collect_bull_candidates()
     return _finalize_screener_response(rows, failures, mode="bull", cache_name=cache_name)
 
 
@@ -637,7 +679,7 @@ def run_bear_screener() -> dict[str, Any]:
     cached = cache_get(cache_name)
     if cached is not None:
         return cached
-    rows, failures = _collect_screener_candidates("bear")
+    rows, failures = _collect_bear_candidates()
     return _finalize_screener_response(rows, failures, mode="bear", cache_name=cache_name)
 
 

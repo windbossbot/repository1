@@ -43,6 +43,7 @@
       <button id="analyzeBtn">분석</button>
       <button id="bullBtn">강세장 스크리너</button>
       <button id="bearBtn">전환·약세 스크리너</button>
+      <button id="resetBtn">초기화</button>
     </div>
     <div id="fearGreed" class="small">Fear & Greed: 아직 조회 전</div>
   </div>
@@ -55,7 +56,7 @@
   </div>
 
   <div class="card">
-    <div id="screenMode" class="small">현재 모드: -</div>
+    <div id="screenMode" class="small">현재 모드: 분석 화면</div>
     <div id="screenResult">아직 스크리너 실행 전</div>
   </div>
 
@@ -142,9 +143,21 @@ async function loadScreener(kind) {
   }
 }
 
+
+function resetView() {
+  document.getElementById('regimeSummary').textContent = '아직 분석 전';
+  document.getElementById('overallSummary').textContent = '';
+  document.getElementById('assetChecks').innerHTML = '';
+  document.getElementById('failures').innerHTML = '';
+  document.getElementById('screenMode').textContent = '현재 모드: 분석 화면';
+  document.getElementById('screenResult').textContent = '아직 스크리너 실행 전';
+  document.getElementById('fearGreed').textContent = 'Fear & Greed: 아직 조회 전';
+}
+
 document.getElementById('analyzeBtn').addEventListener('click', loadAnalyze);
 document.getElementById('bullBtn').addEventListener('click', () => loadScreener('bull'));
 document.getElementById('bearBtn').addEventListener('click', () => loadScreener('bear'));
+document.getElementById('resetBtn').addEventListener('click', resetView);
 attachButtonMotion();
 </script>
 </body>

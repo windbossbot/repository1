@@ -6,6 +6,7 @@ pandas==2.2.3
 numpy==2.0.2
 requests==2.32.3
 ccxt==4.4.45
+yfinance==0.2.54
 # existing project dependencies
 discord
 discord.py[voice]
