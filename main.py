@@ -295,6 +295,38 @@ def regime_score_from_weekly(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def classify_total_regime(total_score: int, max_score: int) -> tuple[str, str]:
+    if max_score <= 0:
+        return "횡보장", "현재 전체 시장은 횡보 국면입니다."
+    ratio = total_score / max_score
+    if ratio >= 0.75:
+        label = "강세장"
+    elif ratio <= 0.40:
+        label = "약세장"
+    else:
+        label = "횡보장"
+    return label, f"현재 전체 시장은 {label} 국면입니다."
+
+
+def classify_asset_trend(score: int) -> str:
+    if score >= 4:
+        return "강세"
+    if score == 3:
+        return "강한 횡보"
+    if score == 2:
+        return "중립"
+    return "약세"
+
+
+def build_asset_summary(name: str, asset_payload: dict[str, Any]) -> str:
+    error = asset_payload.get("error")
+    if error:
+        return f"{name} 데이터 소스 오류로 평가 불가"
+    score = int(asset_payload.get("score", 0))
+    trend = classify_asset_trend(score)
+    return f"{name}는 {trend} 흐름입니다 ({score}/4)."
+
+
 def get_fear_and_greed() -> dict[str, Any]:
     cache_name = "fear_greed"
     cached = cache_get(cache_name)
@@ -513,10 +545,15 @@ def _demo_analysis_payload() -> dict[str, Any]:
     }
     total = sum(v["score"] for v in assets.values())
     regime = "강세장" if total >= 8 else "전환기" if total >= 5 else "약세장"
+    total_regime_label, total_summary = classify_total_regime(total, 16)
+    asset_summaries = [build_asset_summary(k, v) for k, v in assets.items()]
     return {
         "total_score": total,
         "max_score": 16,
         "regime": regime,
+        "regime_by_ratio": total_regime_label,
+        "summary_sentence": total_summary,
+        "asset_summary_sentences": asset_summaries,
         "latest_week": now,
         "assets": assets,
         "fear_greed": {
@@ -592,6 +629,8 @@ def analyze(demo: bool = False) -> JSONResponse:
 
     total = sum(v["score"] for v in per_asset.values())
     regime = "강세장" if total >= 8 else "전환기" if total >= 5 else "약세장"
+    regime_by_ratio, summary_sentence = classify_total_regime(total, 16)
+    asset_summary_sentences = [build_asset_summary(k, v) for k, v in per_asset.items()]
 
     try:
         fear_data = get_fear_and_greed()
@@ -610,6 +649,9 @@ def analyze(demo: bool = False) -> JSONResponse:
             "total_score": total,
             "max_score": 16,
             "regime": regime,
+            "regime_by_ratio": regime_by_ratio,
+            "summary_sentence": summary_sentence,
+            "asset_summary_sentences": asset_summary_sentences,
             "latest_week": max(latest_dates) if latest_dates else None,
             "assets": per_asset,
             "fear_greed": fear_data,
