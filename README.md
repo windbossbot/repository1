@@ -14,9 +14,9 @@ FastAPI 기반 로컬 웹 앱입니다. **실시간 스트리밍 없이** 버튼
 - 1페이지 UI (숫자/상태 중심)
 
 ## 데이터 소스
-- KOSPI: `pykrx` (index 1001)
-- NASDAQ: stooq via `pandas-datareader` (`^NDQ`)
-- BTC/ETH: `ccxt` + binance (`BTC/USDT`, `ETH/USDT`)
+- KOSPI: `pykrx` 우선, 실패 시 stooq (`^KOSPI`) 대체
+- NASDAQ: stooq CSV 직접 조회 (`^NDQ`, fallback 심볼 포함)
+- BTC/ETH: `ccxt` + Kraken 우선, 실패 시 Coinbase로 자동 fallback (`BTC/USD`, `ETH/USD`)
 - Fear & Greed: `https://api.alternative.me/fng/?limit=1`
 
 ## 실행
@@ -44,6 +44,7 @@ uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ## 참고
 - 스크리너 KRX 종목군은 실행 시간을 줄이기 위해 상위 시가총액 종목 일부를 대상으로 검사합니다.
 
+
 ## Render 배포 시 참고
 - `gunicorn: command not found` 오류가 나면 `requirements.txt`에 `gunicorn`이 포함되어 있는지 확인하세요.
 - Procfile은 다음처럼 `web` 프로세스로 실행해야 합니다.
@@ -51,3 +52,7 @@ uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 web: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT:-8000}
 ```
+
+- `pykrx`는 선택사항이며, 설치되지 않아도 KOSPI는 stooq 대체 경로로 동작합니다.
+
+- pandas 버전은 Render에서 안정적으로 동작하는 버전으로 고정했습니다. (pandas-datareader 미사용)

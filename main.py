@@ -138,6 +138,37 @@ def _save_dataframe_cache(cache_name: str, df: pd.DataFrame) -> None:
     cache_set(cache_name, out.to_dict(orient="records"))
 
 
+def _fetch_stooq_with_fallback(symbols: list[str], years: int = 15) -> pd.DataFrame:
+    last_exc: Exception | None = None
+    for sym in symbols:
+        try:
+            return _fetch_stooq_daily(sym, years=years)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise DataSourceError(f"stooq source failure (fallback exhausted): {last_exc}")
+
+
+def _fetch_stooq_daily(symbol: str, years: int = 15) -> pd.DataFrame:
+    end = datetime.now()
+    start = end - timedelta(days=365 * years)
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    try:
+        df = pd.read_csv(url)
+    except Exception as exc:
+        raise DataSourceError(f"stooq source failure ({symbol}): {exc}") from exc
+    if df.empty or "Date" not in df.columns:
+        raise DataSourceError(f"stooq source failure ({symbol}): empty data")
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    df = df[df.index >= start]
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if len(keep) < 5:
+        raise DataSourceError(f"stooq source failure ({symbol}): missing OHLCV columns")
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
 # ----------------------------
 # Source fetchers
 # ----------------------------
@@ -147,23 +178,25 @@ def fetch_kospi_daily() -> pd.DataFrame:
     if cached_df is not None:
         return cached_df
 
-    pykrx_stock = require_module("pykrx.stock", "pip install pykrx")
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=365 * 15)).strftime("%Y%m%d")
-
+    # 1) pykrx 우선 시도
     try:
+        pykrx_stock = require_module("pykrx.stock", "optional: pip install pykrx")
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=365 * 15)).strftime("%Y%m%d")
         df = pykrx_stock.get_index_ohlcv_by_date(start, end, "1001")
-    except Exception as exc:
-        raise DataSourceError(f"KOSPI source failure: {exc}") from exc
+        if not df.empty:
+            df = df.rename(columns={"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"})
+            df.index = pd.to_datetime(df.index)
+            use = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            _save_dataframe_cache(cache_name, use)
+            return use
+    except Exception:
+        pass
 
-    if df.empty:
-        raise DataSourceError("KOSPI source failure: empty data")
-
-    df = df.rename(columns={"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"})
-    df.index = pd.to_datetime(df.index)
-    use = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    _save_dataframe_cache(cache_name, use)
-    return use
+    # 2) pykrx 불가 시 stooq 대체 (심볼 변형 순차 시도)
+    df = _fetch_stooq_with_fallback(["^kospi", "kospi", "^ks11"])
+    _save_dataframe_cache(cache_name, df)
+    return df
 
 
 def fetch_nasdaq_daily() -> pd.DataFrame:
@@ -172,32 +205,35 @@ def fetch_nasdaq_daily() -> pd.DataFrame:
     if cached_df is not None:
         return cached_df
 
-    pdr = require_module("pandas_datareader.data", "pip install pandas-datareader")
-    end = datetime.now()
-    start = end - timedelta(days=365 * 15)
-
-    try:
-        # stooq 나스닥 100 지수 심볼
-        df = pdr.DataReader("^NDQ", "stooq", start=start, end=end)
-    except Exception as exc:
-        raise DataSourceError(f"NASDAQ source failure: {exc}") from exc
-
-    if df.empty:
-        raise DataSourceError("NASDAQ source failure: empty data")
-
-    df = df.sort_index()[["Open", "High", "Low", "Close", "Volume"]]
+    # pandas-datareader 이슈(deprecate_kwarg) 회피를 위해 stooq CSV 직접 사용
+    df = _fetch_stooq_with_fallback(["^ndq", "ndq.us"])
     _save_dataframe_cache(cache_name, df)
     return df
 
 
-def fetch_binance_daily(symbol: str) -> pd.DataFrame:
-    cache_name = f"binance_{symbol.replace('/', '_').lower()}"
+def fetch_crypto_daily(symbol: str) -> pd.DataFrame:
+    # 지역 제한 회피를 위해 Kraken 우선, 실패 시 Coinbase 순서로 시도
+    last_exc: Exception | None = None
+    for exchange_id in ["kraken", "coinbase"]:
+        try:
+            return fetch_exchange_daily(symbol, exchange_id=exchange_id)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise DataSourceError(f"crypto source failure ({symbol}): {last_exc}")
+
+
+def fetch_exchange_daily(symbol: str, exchange_id: str = "kraken") -> pd.DataFrame:
+    cache_name = f"{exchange_id}_{symbol.replace('/', '_').lower()}"
     cached_df = _cached_dataframe(cache_name)
     if cached_df is not None:
         return cached_df
 
     ccxt = require_module("ccxt", "pip install ccxt")
-    exchange = ccxt.binance({"enableRateLimit": True})
+    ex_cls = getattr(ccxt, exchange_id, None)
+    if ex_cls is None:
+        raise DataSourceError(f"Unsupported exchange: {exchange_id}")
+    exchange = ex_cls({"enableRateLimit": True})
     since_ms = int((datetime.now(tz=timezone.utc) - timedelta(days=365 * 6)).timestamp() * 1000)
 
     all_rows: list[list[Any]] = []
@@ -212,14 +248,14 @@ def fetch_binance_daily(symbol: str) -> pd.DataFrame:
             if len(rows) < 1000:
                 break
     except Exception as exc:
-        raise DataSourceError(f"{symbol} source failure: {exc}") from exc
+        raise DataSourceError(f"{exchange_id} {symbol} source failure: {exc}") from exc
 
     if not all_rows:
-        raise DataSourceError(f"{symbol} source failure: empty data")
+        raise DataSourceError(f"{exchange_id} {symbol} source failure: empty data")
 
     df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
     df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True).dt.tz_convert(None)
-    df = df.set_index("Date")[["Open", "High", "Low", "Close", "Volume"]]
+    df = df.set_index("Date")[ ["Open", "High", "Low", "Close", "Volume"] ]
     _save_dataframe_cache(cache_name, df)
     return df
 
@@ -445,9 +481,9 @@ def run_screener(kind: str) -> dict[str, Any]:
     except Exception as exc:
         failures.append(f"KRX screener source failure: {exc}")
 
-    for sym in ["BTC/USDT", "ETH/USDT"]:
+    for sym in ["BTC/USD", "ETH/USD"]:
         try:
-            df = fetch_binance_daily(sym)
+            df = fetch_crypto_daily(sym)
             row = _bull_screener_on_df(sym, df) if kind == "bull" else _bear_transition_screener_on_df(sym, df)
             if row:
                 row["asset_type"] = "Crypto"
@@ -461,7 +497,7 @@ def run_screener(kind: str) -> dict[str, Any]:
         "count": len(results),
         "rows": sorted(results, key=lambda x: x["symbol"])[:100],
         "failures": failures,
-        "sources": ["pykrx (KRX)", "ccxt/binance (Crypto)"],
+        "sources": ["pykrx or stooq (KOSPI)", "stooq (NASDAQ)", "ccxt/kraken→coinbase (Crypto)"],
     }
     cache_set(cache_name, out, params)
     return out
@@ -522,10 +558,10 @@ def analyze(demo: bool = False) -> JSONResponse:
         return JSONResponse(_demo_analysis_payload())
 
     assets = {
-        "KOSPI": (fetch_kospi_daily, "pykrx index 1001"),
-        "NASDAQ": (fetch_nasdaq_daily, "stooq via pandas-datareader (^NDQ)"),
-        "BTC": (lambda: fetch_binance_daily("BTC/USDT"), "ccxt/binance BTC/USDT"),
-        "ETH": (lambda: fetch_binance_daily("ETH/USDT"), "ccxt/binance ETH/USDT"),
+        "KOSPI": (fetch_kospi_daily, "pykrx index 1001 or stooq (^KOSPI)"),
+        "NASDAQ": (fetch_nasdaq_daily, "stooq CSV (^NDQ)"),
+        "BTC": (lambda: fetch_crypto_daily("BTC/USD"), "ccxt/kraken→coinbase BTC/USD"),
+        "ETH": (lambda: fetch_crypto_daily("ETH/USD"), "ccxt/kraken→coinbase ETH/USD"),
     }
 
     per_asset: dict[str, Any] = {}
