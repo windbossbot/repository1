@@ -387,7 +387,7 @@ def infer_price_currency(row: dict[str, Any]) -> str:
     if c in {"KRW", "USD"}:
         return c
     # 규칙: KRX는 KRW, 나머지(NASDAQ/Crypto)는 USD로 간주
-    if row.get("asset_type") == "KRX Stock" or str(row.get("symbol", "")).lower().endswith(".kr"):
+    if row.get("asset_type") == "KRX Stock" or str(row.get("symbol", "")).lower().endswith((".kr", ".ks", ".kq")):
         return "KRW"
     return "USD"
 
@@ -406,8 +406,18 @@ def apply_price_cap_filter(rows: list[dict[str, Any]], usdkrw: float, cap_krw: f
     for row in rows:
         currency = infer_price_currency(row)
         row["price_currency"] = currency
-        row["price_krw"] = round(to_krw_price(row.get("price", 0.0), currency, usdkrw), 2)
-        if row["price_krw"] > cap_krw:
+
+        price = row.get("price")
+        try:
+            price_krw = round(to_krw_price(float(price), currency, usdkrw), 2)
+        except Exception:
+            # 가격 계산 불가한 경우 필터 비교는 생략
+            row["price_krw"] = None
+            kept.append(row)
+            continue
+
+        row["price_krw"] = price_krw
+        if price_krw > cap_krw:
             excluded += 1
             continue
         kept.append(row)
@@ -515,28 +525,28 @@ def _bear_transition_screener_on_df(symbol: str, df_daily: pd.DataFrame, is_stoc
 
 
 def _get_krx_stooq_universe(limit: int = 50) -> list[str]:
-    # stooq에서 비교적 조회가 쉬운 대표 KRX 티커 샘플
+    # stooq KRX 포맷: 코스피 .KS / 코스닥 .KQ
     universe = [
-        "005930.kr",  # Samsung Electronics
-        "000660.kr",  # SK Hynix
-        "035420.kr",  # NAVER
-        "051910.kr",  # LG Chem
-        "207940.kr",  # Samsung Biologics
-        "068270.kr",  # Celltrion
-        "005380.kr",  # Hyundai Motor
-        "006400.kr",  # Samsung SDI
-        "035720.kr",  # Kakao
-        "105560.kr",  # KB Financial
-        "055550.kr",  # Shinhan Financial
-        "096770.kr",  # SK Innovation
-        "012330.kr",  # Hyundai Mobis
-        "028260.kr",  # Samsung C&T
-        "003670.kr",  # POSCO Future M
-        "323410.kr",  # KakaoBank
-        "086790.kr",  # Hana Financial
-        "015760.kr",  # Korea Electric Power
-        "034730.kr",  # SK
-        "010130.kr",  # Korea Zinc
+        "005930.KS",  # Samsung Electronics
+        "000660.KS",  # SK Hynix
+        "035420.KQ",  # NAVER
+        "051910.KS",  # LG Chem
+        "207940.KS",  # Samsung Biologics
+        "068270.KS",  # Celltrion
+        "005380.KS",  # Hyundai Motor
+        "006400.KS",  # Samsung SDI
+        "035720.KQ",  # Kakao
+        "105560.KS",  # KB Financial
+        "055550.KS",  # Shinhan Financial
+        "096770.KS",  # SK Innovation
+        "012330.KS",  # Hyundai Mobis
+        "028260.KS",  # Samsung C&T
+        "003670.KS",  # POSCO Future M
+        "323410.KQ",  # KakaoBank
+        "086790.KS",  # Hana Financial
+        "015760.KS",  # Korea Electric Power
+        "034730.KS",  # SK
+        "010130.KS",  # Korea Zinc
     ]
     return universe[:limit]
 
@@ -545,36 +555,41 @@ def _fetch_krx_ticker_daily(ticker: str, years: int = 3) -> pd.DataFrame:
     return _fetch_stooq_daily(ticker, years=years)
 
 
-def run_screener(kind: str) -> dict[str, Any]:
-    cache_name = "screener"
-    params = {"kind": kind}
-    cached = cache_get(cache_name, params)
-    if cached is not None:
-        return cached
-
+def _collect_screener_candidates(kind: str) -> tuple[list[dict[str, Any]], list[str]]:
     results: list[dict[str, Any]] = []
     failures: list[str] = []
 
     # KRX stocks via stooq universe
+    krx_fail_count = 0
     for ticker in _get_krx_stooq_universe(limit=50):
         try:
             df = _fetch_krx_ticker_daily(ticker)
             if df.empty:
+                krx_fail_count += 1
                 continue
-            row = _bull_screener_on_df(ticker, df, True) if kind == "bull" else _bear_transition_screener_on_df(ticker, df, True)
+            if kind == "bull":
+                row = _bull_screener_on_df(ticker, df, True)
+            else:
+                row = _bear_transition_screener_on_df(ticker, df, True)
             if row:
                 row["asset_type"] = "KRX Stock"
                 row["name"] = ticker
                 row["price_currency"] = "KRW"
                 results.append(row)
-        except Exception as exc:
-            failures.append(f"{ticker} screener source failure: {exc}")
+        except Exception:
+            krx_fail_count += 1
+
+    if krx_fail_count > 0:
+        failures.append(f"KRX 데이터 실패: {krx_fail_count}개 스킵")
 
     # Crypto
     for sym in ["BTC/USD", "ETH/USD"]:
         try:
             df = fetch_crypto_daily(sym)
-            row = _bull_screener_on_df(sym, df) if kind == "bull" else _bear_transition_screener_on_df(sym, df)
+            if kind == "bull":
+                row = _bull_screener_on_df(sym, df)
+            else:
+                row = _bear_transition_screener_on_df(sym, df)
             if row:
                 row["asset_type"] = "Crypto"
                 row["name"] = sym
@@ -583,12 +598,17 @@ def run_screener(kind: str) -> dict[str, Any]:
         except Exception as exc:
             failures.append(f"{sym} screener source failure: {exc}")
 
+    return results, failures
+
+
+def _finalize_screener_response(rows: list[dict[str, Any]], failures: list[str], *, mode: str, cache_name: str) -> dict[str, Any]:
     fx_info = get_usdkrw_rate()
     usdkrw = float(fx_info.get("usdkrw", 1350.0))
-    filtered_rows, excluded_count = apply_price_cap_filter(results, usdkrw=usdkrw, cap_krw=500_000.0)
+    filtered_rows, excluded_count = apply_price_cap_filter(rows, usdkrw=usdkrw, cap_krw=500_000.0)
 
     out = {
-        "kind": kind,
+        "kind": mode,
+        "mode_label": "강세 스크리너" if mode == "bull" else "전환·약세 스크리너",
         "count": len(filtered_rows),
         "rows": sorted(filtered_rows, key=lambda x: x["symbol"])[:100],
         "excluded_by_price_cap": excluded_count,
@@ -599,9 +619,26 @@ def run_screener(kind: str) -> dict[str, Any]:
         "failures": failures,
         "sources": ["stooq (KOSPI/KRX)", "stooq (NASDAQ)", "ccxt/kraken→coinbase (Crypto)"],
     }
-    cache_set(cache_name, out, params)
+    cache_set(cache_name, out)
     return out
 
+
+def run_bull_screener() -> dict[str, Any]:
+    cache_name = "screener_bull"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+    rows, failures = _collect_screener_candidates("bull")
+    return _finalize_screener_response(rows, failures, mode="bull", cache_name=cache_name)
+
+
+def run_bear_screener() -> dict[str, Any]:
+    cache_name = "screener_bear"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+    rows, failures = _collect_screener_candidates("bear")
+    return _finalize_screener_response(rows, failures, mode="bear", cache_name=cache_name)
 
 
 
@@ -699,10 +736,10 @@ def analyze() -> JSONResponse:
 @app.get("/api/screener/bull")
 def screener_bull() -> JSONResponse:
     ensure_cache()
-    return JSONResponse(run_screener("bull"))
+    return JSONResponse(run_bull_screener())
 
 
 @app.get("/api/screener/bear")
 def screener_bear() -> JSONResponse:
     ensure_cache()
-    return JSONResponse(run_screener("bear"))
+    return JSONResponse(run_bear_screener())
