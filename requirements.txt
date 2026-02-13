@@ -1,3 +1,12 @@
+fastapi
+uvicorn
+gunicorn
+jinja2
+pandas
+numpy
+requests
+ccxt
+# existing project dependencies
 discord
 discord.py[voice]
 gtts
