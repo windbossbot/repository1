@@ -1,0 +1,787 @@
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import math
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import requests
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+
+APP_DIR = Path(__file__).resolve().parent
+CACHE_DIR = APP_DIR / "cache"
+CACHE_DB = CACHE_DIR / "cache.sqlite3"
+CACHE_TTL_SECONDS = 12 * 60 * 60
+
+app = FastAPI(title="Market Regime Analyzer")
+templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
+
+
+class DataSourceError(Exception):
+    pass
+
+
+# ----------------------------
+# Optional dependency helpers
+# ----------------------------
+def require_module(module_name: str, hint: str | None = None):
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        msg = f"Missing dependency: {module_name}"
+        if hint:
+            msg += f" ({hint})"
+        raise DataSourceError(msg) from exc
+
+
+# ----------------------------
+# Cache
+# ----------------------------
+def ensure_cache() -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(CACHE_DB) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _cache_key(name: str, params: dict[str, Any] | None = None) -> str:
+    params = params or {}
+    raw = json.dumps({"name": name, "params": params}, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def cache_get(name: str, params: dict[str, Any] | None = None) -> Any | None:
+    key = _cache_key(name, params)
+    with sqlite3.connect(CACHE_DB) as conn:
+        cur = conn.execute("SELECT value, expires_at FROM cache WHERE key = ?", (key,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    value, expires_at = row
+    if int(time.time()) > expires_at:
+        return None
+    return json.loads(value)
+
+
+def cache_set(name: str, value: Any, params: dict[str, Any] | None = None, ttl: int = CACHE_TTL_SECONDS) -> None:
+    key = _cache_key(name, params)
+    now = int(time.time())
+    with sqlite3.connect(CACHE_DB) as conn:
+        conn.execute(
+            """
+            INSERT INTO cache (key, value, expires_at, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                expires_at = excluded.expires_at,
+                created_at = excluded.created_at
+            """,
+            (key, json.dumps(value, default=str), now + ttl, now),
+        )
+        conn.commit()
+
+
+# ----------------------------
+# Data utils
+# ----------------------------
+def _to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return (
+        df.resample("W-FRI")
+        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+        .dropna()
+    )
+
+
+def _to_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return (
+        df.resample("ME")
+        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+        .dropna()
+    )
+
+
+def _cached_dataframe(cache_name: str) -> pd.DataFrame | None:
+    cached = cache_get(cache_name)
+    if cached is None:
+        return None
+    df = pd.DataFrame(cached)
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df.set_index("Date")
+
+
+def _save_dataframe_cache(cache_name: str, df: pd.DataFrame) -> None:
+    out = df.reset_index(names="Date")
+    out["Date"] = out["Date"].astype(str)
+    cache_set(cache_name, out.to_dict(orient="records"))
+
+
+def _fetch_stooq_with_fallback(symbols: list[str], years: int = 15) -> pd.DataFrame:
+    last_exc: Exception | None = None
+    for sym in symbols:
+        try:
+            return _fetch_stooq_daily(sym, years=years)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise DataSourceError(f"stooq source failure (fallback exhausted): {last_exc}")
+
+
+def _fetch_stooq_daily(symbol: str, years: int = 15) -> pd.DataFrame:
+    end = datetime.now()
+    start = end - timedelta(days=365 * years)
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    try:
+        df = pd.read_csv(url)
+    except Exception as exc:
+        raise DataSourceError(f"stooq source failure ({symbol}): {exc}") from exc
+    if df.empty or "Date" not in df.columns:
+        raise DataSourceError(f"stooq source failure ({symbol}): empty data")
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    df = df[df.index >= start]
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if len(keep) < 5:
+        raise DataSourceError(f"stooq source failure ({symbol}): missing OHLCV columns")
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+# ----------------------------
+# Source fetchers
+# ----------------------------
+def fetch_kospi_daily() -> pd.DataFrame:
+    cache_name = "kospi_daily"
+    cached_df = _cached_dataframe(cache_name)
+    if cached_df is not None:
+        return cached_df
+
+    # KOSPI는 stooq CSV만 사용
+    df = _fetch_stooq_with_fallback(["^kospi", "kospi", "^ks11"])
+    _save_dataframe_cache(cache_name, df)
+    return df
+
+
+def fetch_nasdaq_daily() -> pd.DataFrame:
+    cache_name = "nasdaq_daily"
+    cached_df = _cached_dataframe(cache_name)
+    if cached_df is not None:
+        return cached_df
+
+    # pandas-datareader 이슈(deprecate_kwarg) 회피를 위해 stooq CSV 직접 사용
+    df = _fetch_stooq_with_fallback(["^ndq", "ndq.us"])
+    _save_dataframe_cache(cache_name, df)
+    return df
+
+
+def fetch_crypto_daily(symbol: str) -> pd.DataFrame:
+    # 지역 제한 회피를 위해 Kraken 우선, 실패 시 Coinbase 순서로 시도
+    last_exc: Exception | None = None
+    for exchange_id in ["kraken", "coinbase"]:
+        try:
+            return fetch_exchange_daily(symbol, exchange_id=exchange_id)
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise DataSourceError(f"crypto source failure ({symbol}): {last_exc}")
+
+
+def fetch_exchange_daily(symbol: str, exchange_id: str = "kraken") -> pd.DataFrame:
+    cache_name = f"{exchange_id}_{symbol.replace('/', '_').lower()}"
+    cached_df = _cached_dataframe(cache_name)
+    if cached_df is not None:
+        return cached_df
+
+    ccxt = require_module("ccxt", "pip install ccxt")
+    ex_cls = getattr(ccxt, exchange_id, None)
+    if ex_cls is None:
+        raise DataSourceError(f"Unsupported exchange: {exchange_id}")
+    exchange = ex_cls({"enableRateLimit": True})
+    since_ms = int((datetime.now(tz=timezone.utc) - timedelta(days=365 * 6)).timestamp() * 1000)
+
+    all_rows: list[list[Any]] = []
+    cursor = since_ms
+    try:
+        while True:
+            rows = exchange.fetch_ohlcv(symbol, timeframe="1d", since=cursor, limit=1000)
+            if not rows:
+                break
+            all_rows.extend(rows)
+            cursor = rows[-1][0] + 24 * 60 * 60 * 1000
+            if len(rows) < 1000:
+                break
+    except Exception as exc:
+        raise DataSourceError(f"{exchange_id} {symbol} source failure: {exc}") from exc
+
+    if not all_rows:
+        raise DataSourceError(f"{exchange_id} {symbol} source failure: empty data")
+
+    df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df["Date"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True).dt.tz_convert(None)
+    df = df.set_index("Date")[ ["Open", "High", "Low", "Close", "Volume"] ]
+    _save_dataframe_cache(cache_name, df)
+    return df
+
+
+# ----------------------------
+# Analysis logic
+# ----------------------------
+def regime_score_from_weekly(df: pd.DataFrame) -> dict[str, Any]:
+    if len(df) < 30:
+        raise DataSourceError("Not enough weekly data")
+
+    c = df.copy()
+    c["MA60"] = c["Close"].rolling(60).mean()
+    c["MA120"] = c["Close"].rolling(120).mean()
+
+    latest = c.iloc[-1]
+    cond1 = bool(latest["Close"] >= latest["MA60"]) if not math.isnan(latest["MA60"]) else False
+    cond2 = bool(latest["Close"] >= latest["MA120"]) if not math.isnan(latest["MA120"]) else False
+
+    lookback20 = c.iloc[-21:-1] if len(c) >= 21 else c.iloc[:-1]
+    cond3 = bool(latest["Close"] > lookback20["High"].max()) if not lookback20.empty else False
+
+    recent10 = c.iloc[-10:]
+    prev10 = c.iloc[-20:-10]
+    cond4 = bool(recent10["High"].max() > prev10["High"].max()) if (not recent10.empty and not prev10.empty) else False
+
+    checks = {
+        "close_ge_ma60w": cond1,
+        "close_ge_ma120w": cond2,
+        "close_break_20w_high": cond3,
+        "higher_high_recent_10w": cond4,
+    }
+    return {
+        "score": sum(checks.values()),
+        "checks": checks,
+        "latest_week": str(c.index[-1].date()),
+    }
+
+
+def classify_total_regime(total_score: int, max_score: int) -> tuple[str, str]:
+    if max_score <= 0:
+        return "횡보장", "현재 전체 시장은 횡보 국면입니다."
+    ratio = total_score / max_score
+    if ratio >= 0.75:
+        label = "강세장"
+    elif ratio <= 0.40:
+        label = "약세장"
+    else:
+        label = "횡보장"
+    return label, f"현재 전체 시장은 {label} 국면입니다."
+
+
+def classify_asset_trend(score: int) -> str:
+    if score >= 4:
+        return "강세"
+    if score == 3:
+        return "강한 횡보"
+    if score == 2:
+        return "중립"
+    return "약세"
+
+
+def classify_asset_trend_label(asset_payload: dict[str, Any]) -> str:
+    if asset_payload.get("error"):
+        return "오류"
+    score = int(asset_payload.get("score", 0))
+    if score >= 3:
+        return "강세"
+    if score == 2:
+        return "중립"
+    return "약세"
+
+
+def build_asset_summary(name: str, asset_payload: dict[str, Any]) -> str:
+    error = asset_payload.get("error")
+    if error:
+        return f"{name} 데이터 소스 오류로 평가 불가"
+    score = int(asset_payload.get("score", 0))
+    trend = classify_asset_trend(score)
+    return f"{name}는 {trend} 흐름입니다 ({score}/4)."
+
+
+def get_fear_and_greed() -> dict[str, Any]:
+    cache_name = "fear_greed"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+        entry = payload["data"][0]
+    except Exception as exc:
+        raise DataSourceError(f"Fear & Greed source failure: {exc}") from exc
+
+    out = {
+        "value": int(entry.get("value", 0)),
+        "classification": entry.get("value_classification", "N/A"),
+        "timestamp": datetime.fromtimestamp(int(entry.get("timestamp", 0)), tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "source": "alternative.me (Fear & Greed Index)",
+    }
+    cache_set(cache_name, out)
+    return out
+
+
+def get_usdkrw_rate() -> dict[str, Any]:
+    cache_name = "usdkrw_rate"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+
+    fallback_rate = 1350.0
+
+    # 1) exchangerate.host
+    try:
+        r = requests.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "KRW"}, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+        rate = float(d.get("rates", {}).get("KRW"))
+        out = {"usdkrw": rate, "source": "exchangerate.host", "is_fallback": False}
+        cache_set(cache_name, out)
+        return out
+    except Exception:
+        pass
+
+    # 2) frankfurter fallback API
+    try:
+        r = requests.get("https://api.frankfurter.app/latest", params={"from": "USD", "to": "KRW"}, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+        rate = float(d.get("rates", {}).get("KRW"))
+        out = {"usdkrw": rate, "source": "frankfurter.app", "is_fallback": False}
+        cache_set(cache_name, out)
+        return out
+    except Exception:
+        out = {"usdkrw": fallback_rate, "source": "fallback", "is_fallback": True}
+        cache_set(cache_name, out)
+        return out
+
+
+def infer_price_currency(row: dict[str, Any]) -> str:
+    c = row.get("price_currency")
+    if c in {"KRW", "USD"}:
+        return c
+    # 규칙: KRX는 KRW, 나머지(NASDAQ/Crypto)는 USD로 간주
+    if row.get("asset_type") == "KRX Stock" or str(row.get("symbol", "")).lower().endswith((".kr", ".ks", ".kq")):
+        return "KRW"
+    return "USD"
+
+
+def to_krw_price(price: float, currency: str, usdkrw: float) -> float:
+    if currency == "KRW":
+        return float(price)
+    if currency == "USD":
+        return float(price) * float(usdkrw)
+    return float(price)
+
+
+def apply_price_cap_filter(rows: list[dict[str, Any]], usdkrw: float, cap_krw: float = 500_000.0) -> tuple[list[dict[str, Any]], int]:
+    kept: list[dict[str, Any]] = []
+    excluded = 0
+    for row in rows:
+        currency = infer_price_currency(row)
+        row["price_currency"] = currency
+
+        price = row.get("price")
+        try:
+            price_krw = round(to_krw_price(float(price), currency, usdkrw), 2)
+        except Exception:
+            # 가격 계산 불가한 경우 필터 비교는 생략
+            row["price_krw"] = None
+            kept.append(row)
+            continue
+
+        row["price_krw"] = price_krw
+        if price_krw > cap_krw:
+            excluded += 1
+            continue
+        kept.append(row)
+    return kept, excluded
+
+
+# ----------------------------
+# Screeners
+# ----------------------------
+def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["MA20"] = d["Close"].rolling(20).mean()
+    d["MA60"] = d["Close"].rolling(60).mean()
+    d["MA120"] = d["Close"].rolling(120).mean()
+    d["Value"] = d["Close"] * d["Volume"]
+    return d
+
+
+def _screen_common_ready(df_daily: pd.DataFrame) -> bool:
+    if len(df_daily) < 260:
+        return False
+    if len(_to_monthly(df_daily)) < 3:
+        return False
+    if len(_to_weekly(df_daily)) < 130:
+        return False
+    return True
+
+
+def _bull_screener_on_df(symbol: str, df_daily: pd.DataFrame, is_stock: bool = False) -> dict[str, Any] | None:
+    if not _screen_common_ready(df_daily):
+        return None
+
+    d = _calculate_indicators(df_daily)
+    w = _to_weekly(df_daily)
+    latest = d.iloc[-1]
+
+    avg_val_5d = d["Value"].tail(5).mean()
+    if is_stock and avg_val_5d < 10_000_000_000:
+        return None
+
+    ma120_prev = d["MA120"].iloc[-6]
+    within_5 = abs(latest["Close"] / latest["MA20"] - 1) <= 0.05 if not math.isnan(latest["MA20"]) else False
+    overheat = (latest["Close"] / d["High"].tail(252).max() - 1) > 0.40
+
+    cond = [
+        w["Close"].iloc[-1] >= w["Close"].rolling(60).mean().iloc[-1],
+        w["Close"].iloc[-1] >= w["Close"].rolling(120).mean().iloc[-1],
+        latest["Close"] >= latest["MA120"],
+        latest["MA120"] > ma120_prev,
+        latest["MA20"] >= latest["MA60"],
+        within_5,
+        not overheat,
+    ]
+    if not all(bool(x) for x in cond):
+        return None
+
+    return {
+        "symbol": symbol,
+        "price": round(float(latest["Close"]), 4),
+        "dist_ma20_pct": round((latest["Close"] / latest["MA20"] - 1) * 100, 2),
+        "dist_ma120_pct": round((latest["Close"] / latest["MA120"] - 1) * 100, 2),
+        "from_52w_high_pct": round((latest["Close"] / d["High"].tail(252).max() - 1) * 100, 2),
+        "avg_value_5d": int(avg_val_5d) if not math.isnan(avg_val_5d) else None,
+    }
+
+
+def _bear_transition_screener_on_df(symbol: str, df_daily: pd.DataFrame, is_stock: bool = False) -> dict[str, Any] | None:
+    if not _screen_common_ready(df_daily):
+        return None
+
+    d = _calculate_indicators(df_daily)
+    w = _to_weekly(df_daily)
+    m = _to_monthly(df_daily)
+    latest = d.iloc[-1]
+
+    avg_val_5d = d["Value"].tail(5).mean()
+    if is_stock and avg_val_5d < 10_000_000_000:
+        return None
+
+    ma120m = m["Close"].rolling(120).mean().iloc[-1] if len(m) >= 120 else np.nan
+    ma120w = w["Close"].rolling(120).mean().iloc[-1]
+    structure_survive = (not math.isnan(ma120m) and latest["Close"] >= ma120m) or (latest["Close"] >= ma120w)
+
+    close = d["Close"]
+    ma120 = d["MA120"]
+    cross_up = ((close > ma120) & (close.shift(1) <= ma120.shift(1))).tail(60).any()
+    now_below = latest["Close"] < latest["MA120"] if not math.isnan(latest["MA120"]) else False
+    pos = (latest["Close"] / latest["MA120"] - 1) if not math.isnan(latest["MA120"]) else -999
+
+    recent_peak = d["High"].tail(252).max()
+    collapse = (latest["Close"] / recent_peak - 1) <= -0.70
+
+    cond = [structure_survive, bool(cross_up), now_below, (-0.10 <= pos <= 0.02), not collapse]
+    if not all(cond):
+        return None
+
+    return {
+        "symbol": symbol,
+        "price": round(float(latest["Close"]), 4),
+        "dist_ma20_pct": round((latest["Close"] / latest["MA20"] - 1) * 100, 2),
+        "dist_ma120_pct": round((latest["Close"] / latest["MA120"] - 1) * 100, 2),
+        "from_52w_high_pct": round((latest["Close"] / recent_peak - 1) * 100, 2),
+        "avg_value_5d": int(avg_val_5d) if not math.isnan(avg_val_5d) else None,
+    }
+
+
+def _get_krx_stooq_universe(limit: int = 50) -> list[str]:
+    # stooq KRX 포맷: 코스피 .KS / 코스닥 .KQ
+    universe = [
+        "005930.KS",  # Samsung Electronics
+        "000660.KS",  # SK Hynix
+        "035420.KQ",  # NAVER
+        "051910.KS",  # LG Chem
+        "207940.KS",  # Samsung Biologics
+        "068270.KS",  # Celltrion
+        "005380.KS",  # Hyundai Motor
+        "006400.KS",  # Samsung SDI
+        "035720.KQ",  # Kakao
+        "105560.KS",  # KB Financial
+        "055550.KS",  # Shinhan Financial
+        "096770.KS",  # SK Innovation
+        "012330.KS",  # Hyundai Mobis
+        "028260.KS",  # Samsung C&T
+        "003670.KS",  # POSCO Future M
+        "323410.KQ",  # KakaoBank
+        "086790.KS",  # Hana Financial
+        "015760.KS",  # Korea Electric Power
+        "034730.KS",  # SK
+        "010130.KS",  # Korea Zinc
+    ]
+    return universe[:limit]
+
+
+def _fetch_krx_ticker_daily(ticker: str, years: int = 3) -> pd.DataFrame:
+    yf = require_module("yfinance", "pip install yfinance")
+    end = datetime.now()
+    start = end - timedelta(days=365 * years)
+    try:
+        df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), auto_adjust=False, progress=False)
+    except Exception as exc:
+        raise DataSourceError(f"yfinance source failure ({ticker}): {exc}") from exc
+    if df is None or df.empty:
+        raise DataSourceError(f"yfinance source failure ({ticker}): empty data")
+
+    # yfinance 컬럼 표준화
+    cols = {str(c).split(" ")[0]: c for c in df.columns}
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(k in cols for k in needed):
+        raise DataSourceError(f"yfinance source failure ({ticker}): missing OHLCV columns")
+    out = df[[cols[k] for k in needed]].copy()
+    out.columns = needed
+    out.index = pd.to_datetime(out.index).tz_localize(None) if getattr(out.index, "tz", None) is not None else pd.to_datetime(out.index)
+    return out
+
+
+def _collect_bull_candidates() -> tuple[list[dict[str, Any]], list[str]]:
+    results: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    krx_fail_count = 0
+    for ticker in _get_krx_stooq_universe(limit=50):
+        try:
+            df = _fetch_krx_ticker_daily(ticker)
+            row = _bull_screener_on_df(ticker, df, True)
+            if row:
+                row["asset_type"] = "KRX Stock"
+                row["name"] = ticker
+                row["price_currency"] = "KRW"
+                results.append(row)
+        except Exception:
+            krx_fail_count += 1
+
+    if krx_fail_count > 0:
+        failures.append(f"KRX 실패: {krx_fail_count}개 스킵")
+
+    for sym in ["BTC/USD", "ETH/USD"]:
+        try:
+            df = fetch_crypto_daily(sym)
+            row = _bull_screener_on_df(sym, df)
+            if row:
+                row["asset_type"] = "Crypto"
+                row["name"] = sym
+                row["price_currency"] = "USD"
+                results.append(row)
+        except Exception as exc:
+            failures.append(f"{sym} screener source failure: {exc}")
+
+    return results, failures
+
+
+def _collect_bear_candidates() -> tuple[list[dict[str, Any]], list[str]]:
+    results: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    krx_fail_count = 0
+    for ticker in _get_krx_stooq_universe(limit=50):
+        try:
+            df = _fetch_krx_ticker_daily(ticker)
+            row = _bear_transition_screener_on_df(ticker, df, True)
+            if row:
+                row["asset_type"] = "KRX Stock"
+                row["name"] = ticker
+                row["price_currency"] = "KRW"
+                results.append(row)
+        except Exception:
+            krx_fail_count += 1
+
+    if krx_fail_count > 0:
+        failures.append(f"KRX 실패: {krx_fail_count}개 스킵")
+
+    for sym in ["BTC/USD", "ETH/USD"]:
+        try:
+            df = fetch_crypto_daily(sym)
+            row = _bear_transition_screener_on_df(sym, df)
+            if row:
+                row["asset_type"] = "Crypto"
+                row["name"] = sym
+                row["price_currency"] = "USD"
+                results.append(row)
+        except Exception as exc:
+            failures.append(f"{sym} screener source failure: {exc}")
+
+    return results, failures
+
+
+def _finalize_screener_response(rows: list[dict[str, Any]], failures: list[str], *, mode: str, cache_name: str) -> dict[str, Any]:
+    fx_info = get_usdkrw_rate()
+    usdkrw = float(fx_info.get("usdkrw", 1350.0))
+    filtered_rows, excluded_count = apply_price_cap_filter(rows, usdkrw=usdkrw, cap_krw=500_000.0)
+
+    out = {
+        "kind": mode,
+        "mode_label": "강세 스크리너" if mode == "bull" else "전환·약세 스크리너",
+        "count": len(filtered_rows),
+        "rows": sorted(filtered_rows, key=lambda x: x["symbol"])[:100],
+        "excluded_by_price_cap": excluded_count,
+        "price_cap_krw": 500_000,
+        "usdkrw": usdkrw,
+        "usdkrw_source": fx_info.get("source"),
+        "usdkrw_fallback": bool(fx_info.get("is_fallback", False)),
+        "failures": failures,
+        "sources": ["stooq (KOSPI/KRX)", "stooq (NASDAQ)", "ccxt/kraken→coinbase (Crypto)"],
+    }
+    cache_set(cache_name, out)
+    return out
+
+
+def run_bull_screener() -> dict[str, Any]:
+    cache_name = "screener_bull"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+    rows, failures = _collect_bull_candidates()
+    return _finalize_screener_response(rows, failures, mode="bull", cache_name=cache_name)
+
+
+def run_bear_screener() -> dict[str, Any]:
+    cache_name = "screener_bear"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+    rows, failures = _collect_bear_candidates()
+    return _finalize_screener_response(rows, failures, mode="bear", cache_name=cache_name)
+
+
+
+# ----------------------------
+# FastAPI routes
+# ----------------------------
+@app.on_event("startup")
+def on_startup() -> None:
+    ensure_cache()
+
+
+@app.get("/")
+def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request, "ttl_hours": CACHE_TTL_SECONDS // 3600})
+
+
+@app.get("/api/ping")
+def ping() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/analyze")
+def analyze() -> JSONResponse:
+    ensure_cache()
+
+    assets = {
+        "KOSPI": (fetch_kospi_daily, "stooq (^KOSPI)"),
+        "NASDAQ": (fetch_nasdaq_daily, "stooq CSV (^NDQ)"),
+        "BTC": (lambda: fetch_crypto_daily("BTC/USD"), "ccxt/kraken→coinbase BTC/USD"),
+        "ETH": (lambda: fetch_crypto_daily("ETH/USD"), "ccxt/kraken→coinbase ETH/USD"),
+    }
+
+    per_asset: dict[str, Any] = {}
+    failures: list[str] = []
+    latest_dates: list[str] = []
+
+    for name, (fetcher, source_name) in assets.items():
+        try:
+            weekly = _to_weekly(fetcher())
+            score = regime_score_from_weekly(weekly)
+            score["source"] = source_name
+            score["trend_label"] = classify_asset_trend_label(score)
+            per_asset[name] = score
+            latest_dates.append(score["latest_week"])
+        except Exception as exc:
+            per_asset[name] = {
+                "score": 0,
+                "checks": {
+                    "close_ge_ma60w": False,
+                    "close_ge_ma120w": False,
+                    "close_break_20w_high": False,
+                    "higher_high_recent_10w": False,
+                },
+                "latest_week": None,
+                "source": source_name,
+                "error": str(exc),
+                "trend_label": "오류",
+            }
+            failures.append(f"{name} source failure")
+
+    total = sum(v["score"] for v in per_asset.values())
+    regime = "강세장" if total >= 8 else "전환기" if total >= 5 else "약세장"
+    regime_by_ratio, summary_sentence = classify_total_regime(total, 16)
+    asset_summary_sentences = [build_asset_summary(k, v) for k, v in per_asset.items()]
+
+    try:
+        fear_data = get_fear_and_greed()
+    except Exception as exc:
+        fear_data = {
+            "value": None,
+            "classification": "N/A",
+            "timestamp": None,
+            "source": "alternative.me (Fear & Greed Index)",
+            "error": str(exc),
+        }
+        failures.append("Fear & Greed source failure")
+
+    return JSONResponse(
+        {
+            "total_score": total,
+            "max_score": 16,
+            "regime": regime,
+            "regime_by_ratio": regime_by_ratio,
+            "summary_sentence": summary_sentence,
+            "asset_summary_sentences": asset_summary_sentences,
+            "latest_week": max(latest_dates) if latest_dates else None,
+            "assets": per_asset,
+            "fear_greed": fear_data,
+            "failures": failures,
+            "cache_ttl_hours": CACHE_TTL_SECONDS // 3600,
+        }
+    )
+
+
+@app.get("/api/screener/bull")
+def screener_bull() -> JSONResponse:
+    ensure_cache()
+    return JSONResponse(run_bull_screener())
+
+
+@app.get("/api/screener/bear")
+def screener_bear() -> JSONResponse:
+    ensure_cache()
+    return JSONResponse(run_bear_screener())
