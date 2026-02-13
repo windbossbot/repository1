@@ -7,7 +7,37 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; color: #222; }
     h1 { margin-bottom: 8px; }
-    button { margin: 4px 8px 8px 0; padding: 8px 14px; cursor: pointer; }
+    button {
+      margin: 4px 8px 8px 0;
+      padding: 8px 14px;
+      cursor: pointer;
+      border: 1px solid #a9a9a9;
+      border-radius: 8px;
+      background: #fff;
+      position: relative;
+      overflow: hidden;
+      transform: translateY(0) scale(1);
+      transition: transform 120ms ease, box-shadow 160ms ease, background-color 160ms ease;
+    }
+    button:hover { box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12); background-color: #fafafa; }
+    button:active { transform: translateY(1px) scale(0.97); }
+    button.pulse { animation: btnPulse 220ms ease; }
+    @keyframes btnPulse {
+      0% { transform: scale(0.97); }
+      60% { transform: scale(1.03); }
+      100% { transform: scale(1); }
+    }
+    .ripple {
+      position: absolute;
+      border-radius: 999px;
+      transform: scale(0);
+      animation: ripple 450ms ease-out;
+      background: rgba(33, 150, 243, 0.35);
+      pointer-events: none;
+    }
+    @keyframes ripple {
+      to { transform: scale(5); opacity: 0; }
+    }
     .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
     .small { color: #555; font-size: 0.9rem; }
     table { width: 100%; border-collapse: collapse; margin-top: 8px; }
@@ -44,6 +74,27 @@
 
 <script>
 const fmtNum = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '-' : Number(v).toLocaleString();
+
+function attachButtonMotion() {
+  document.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      btn.classList.remove('pulse');
+      void btn.offsetWidth;
+      btn.classList.add('pulse');
+
+      const rect = btn.getBoundingClientRect();
+      const ripple = document.createElement('span');
+      ripple.className = 'ripple';
+      const size = Math.max(rect.width, rect.height);
+      ripple.style.width = `${size}px`;
+      ripple.style.height = `${size}px`;
+      ripple.style.left = `${e.clientX - rect.left - size / 2}px`;
+      ripple.style.top = `${e.clientY - rect.top - size / 2}px`;
+      btn.appendChild(ripple);
+      ripple.addEventListener('animationend', () => ripple.remove());
+    });
+  });
+}
 
 async function checkServer() {
   try {
@@ -133,6 +184,7 @@ document.getElementById('analyzeBtn').addEventListener('click', () => loadAnalyz
 document.getElementById('demoAnalyzeBtn').addEventListener('click', () => loadAnalyze(true));
 document.getElementById('bullBtn').addEventListener('click', () => loadScreener('bull'));
 document.getElementById('bearBtn').addEventListener('click', () => loadScreener('bear'));
+attachButtonMotion();
 checkServer();
 </script>
 </body>
