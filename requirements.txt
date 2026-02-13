@@ -1,14 +1,6 @@
 fastapi==0.115.6
 uvicorn==0.32.1
-gunicorn==23.0.0
 jinja2==3.1.4
 pandas==2.2.3
-numpy==2.0.2
 requests==2.32.3
 ccxt==4.4.45
-yfinance==0.2.54
-# existing project dependencies
-discord
-discord.py[voice]
-gtts
-PyGithub
