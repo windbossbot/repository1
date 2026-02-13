@@ -347,6 +347,73 @@ def get_fear_and_greed() -> dict[str, Any]:
     return out
 
 
+def get_usdkrw_rate() -> dict[str, Any]:
+    cache_name = "usdkrw_rate"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+
+    fallback_rate = 1350.0
+
+    # 1) exchangerate.host
+    try:
+        r = requests.get("https://api.exchangerate.host/latest", params={"base": "USD", "symbols": "KRW"}, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+        rate = float(d.get("rates", {}).get("KRW"))
+        out = {"usdkrw": rate, "source": "exchangerate.host", "is_fallback": False}
+        cache_set(cache_name, out)
+        return out
+    except Exception:
+        pass
+
+    # 2) frankfurter fallback API
+    try:
+        r = requests.get("https://api.frankfurter.app/latest", params={"from": "USD", "to": "KRW"}, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+        rate = float(d.get("rates", {}).get("KRW"))
+        out = {"usdkrw": rate, "source": "frankfurter.app", "is_fallback": False}
+        cache_set(cache_name, out)
+        return out
+    except Exception:
+        out = {"usdkrw": fallback_rate, "source": "fallback", "is_fallback": True}
+        cache_set(cache_name, out)
+        return out
+
+
+def infer_price_currency(row: dict[str, Any]) -> str:
+    c = row.get("price_currency")
+    if c in {"KRW", "USD"}:
+        return c
+    # 규칙: KRX는 KRW, 나머지(NASDAQ/Crypto)는 USD로 간주
+    if row.get("asset_type") == "KRX Stock" or str(row.get("symbol", "")).lower().endswith(".kr"):
+        return "KRW"
+    return "USD"
+
+
+def to_krw_price(price: float, currency: str, usdkrw: float) -> float:
+    if currency == "KRW":
+        return float(price)
+    if currency == "USD":
+        return float(price) * float(usdkrw)
+    return float(price)
+
+
+def apply_price_cap_filter(rows: list[dict[str, Any]], usdkrw: float, cap_krw: float = 500_000.0) -> tuple[list[dict[str, Any]], int]:
+    kept: list[dict[str, Any]] = []
+    excluded = 0
+    for row in rows:
+        currency = infer_price_currency(row)
+        row["price_currency"] = currency
+        row["price_krw"] = round(to_krw_price(row.get("price", 0.0), currency, usdkrw), 2)
+        if row["price_krw"] > cap_krw:
+            excluded += 1
+            continue
+        kept.append(row)
+    return kept, excluded
+
+
 # ----------------------------
 # Screeners
 # ----------------------------
@@ -498,6 +565,7 @@ def run_screener(kind: str) -> dict[str, Any]:
             if row:
                 row["asset_type"] = "KRX Stock"
                 row["name"] = ticker
+                row["price_currency"] = "KRW"
                 results.append(row)
         except Exception as exc:
             failures.append(f"{ticker} screener source failure: {exc}")
@@ -510,14 +578,24 @@ def run_screener(kind: str) -> dict[str, Any]:
             if row:
                 row["asset_type"] = "Crypto"
                 row["name"] = sym
+                row["price_currency"] = "USD"
                 results.append(row)
         except Exception as exc:
             failures.append(f"{sym} screener source failure: {exc}")
 
+    fx_info = get_usdkrw_rate()
+    usdkrw = float(fx_info.get("usdkrw", 1350.0))
+    filtered_rows, excluded_count = apply_price_cap_filter(results, usdkrw=usdkrw, cap_krw=500_000.0)
+
     out = {
         "kind": kind,
-        "count": len(results),
-        "rows": sorted(results, key=lambda x: x["symbol"])[:100],
+        "count": len(filtered_rows),
+        "rows": sorted(filtered_rows, key=lambda x: x["symbol"])[:100],
+        "excluded_by_price_cap": excluded_count,
+        "price_cap_krw": 500_000,
+        "usdkrw": usdkrw,
+        "usdkrw_source": fx_info.get("source"),
+        "usdkrw_fallback": bool(fx_info.get("is_fallback", False)),
         "failures": failures,
         "sources": ["stooq (KOSPI/KRX)", "stooq (NASDAQ)", "ccxt/kraken→coinbase (Crypto)"],
     }
@@ -525,40 +603,6 @@ def run_screener(kind: str) -> dict[str, Any]:
     return out
 
 
-def _demo_analysis_payload() -> dict[str, Any]:
-    now = datetime.now().strftime("%Y-%m-%d")
-    assets = {
-        "KOSPI": {"score": 2, "checks": {"close_ge_ma60w": True, "close_ge_ma120w": False, "close_break_20w_high": False, "higher_high_recent_10w": True}, "latest_week": now, "source": "demo data", "error": "데모 모드"},
-        "NASDAQ": {"score": 3, "checks": {"close_ge_ma60w": True, "close_ge_ma120w": True, "close_break_20w_high": False, "higher_high_recent_10w": True}, "latest_week": now, "source": "demo data", "error": "데모 모드"},
-        "BTC": {"score": 4, "checks": {"close_ge_ma60w": True, "close_ge_ma120w": True, "close_break_20w_high": True, "higher_high_recent_10w": True}, "latest_week": now, "source": "demo data", "error": "데모 모드"},
-        "ETH": {"score": 3, "checks": {"close_ge_ma60w": True, "close_ge_ma120w": True, "close_break_20w_high": True, "higher_high_recent_10w": False}, "latest_week": now, "source": "demo data", "error": "데모 모드"},
-    }
-    total = sum(v["score"] for v in assets.values())
-    regime = "강세장" if total >= 8 else "전환기" if total >= 5 else "약세장"
-    total_regime_label, total_summary = classify_total_regime(total, 16)
-    for v in assets.values():
-        v["trend_label"] = classify_asset_trend_label(v)
-    asset_summaries = [build_asset_summary(k, v) for k, v in assets.items()]
-    return {
-        "total_score": total,
-        "max_score": 16,
-        "regime": regime,
-        "regime_by_ratio": total_regime_label,
-        "summary_sentence": total_summary,
-        "asset_summary_sentences": asset_summaries,
-        "latest_week": now,
-        "assets": assets,
-        "fear_greed": {
-            "value": 55,
-            "classification": "Neutral",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source": "alternative.me (Fear & Greed Index) - demo",
-            "error": "데모 모드"
-        },
-        "failures": ["데모 모드: 실제 데이터 소스 대신 샘플 표시"],
-        "cache_ttl_hours": CACHE_TTL_SECONDS // 3600,
-        "is_demo": True,
-    }
 
 
 # ----------------------------
@@ -580,11 +624,8 @@ def ping() -> dict[str, str]:
 
 
 @app.get("/api/analyze")
-def analyze(demo: bool = False) -> JSONResponse:
+def analyze() -> JSONResponse:
     ensure_cache()
-
-    if demo:
-        return JSONResponse(_demo_analysis_payload())
 
     assets = {
         "KOSPI": (fetch_kospi_daily, "stooq (^KOSPI)"),
@@ -651,7 +692,6 @@ def analyze(demo: bool = False) -> JSONResponse:
             "fear_greed": fear_data,
             "failures": failures,
             "cache_ttl_hours": CACHE_TTL_SECONDS // 3600,
-            "is_demo": False,
         }
     )
 
