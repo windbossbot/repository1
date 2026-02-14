@@ -21,7 +21,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "cache.sqlite3"
 TTL_SECONDS = 12 * 60 * 60
 
-app = FastAPI(title="주식 코인 필터기")
+app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 MARKETS = {
