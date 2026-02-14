@@ -9,6 +9,7 @@ import streamlit as st
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 STATE_FILE = Path("state.json")
 CANDIDATES_FILE = Path("candidates.json")
+COINGECKO_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 DEFAULT_STATE = {
     "last_page": 1,
@@ -111,8 +112,10 @@ def fetch_markets_page(page: int, per_page: int = 100, vs_currency: str = "usd")
         "price_change_percentage": "24h",
     }
     try:
-        resp = requests.get(url, params=params, timeout=20)
-        resp.raise_for_status()
+        resp = requests.get(url, params=params, headers=COINGECKO_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            st.warning(f"CoinGecko /coins/markets 응답 코드: {resp.status_code}")
+            return [], f"CoinGecko 시장 데이터 조회 실패 (status: {resp.status_code})"
         data = resp.json()
         if isinstance(data, list):
             return data, None
@@ -126,13 +129,15 @@ def fetch_daily_market_chart(coin_id: str, days: int = 400, vs_currency: str = "
     """CoinGecko endpoint: /coins/{id}/market_chart"""
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
     params = {
-        "vs_currency": vs_currency,
-        "days": max(days, 200),
+        "vs_currency": "usd",
+        "days": 365,
         "interval": "daily",
     }
     try:
-        resp = requests.get(url, params=params, timeout=20)
-        resp.raise_for_status()
+        resp = requests.get(url, params=params, headers=COINGECKO_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            st.warning(f"CoinGecko /coins/{coin_id}/market_chart 응답 코드: {resp.status_code}")
+            return [], f"{coin_id.upper()} 일봉 데이터 조회 실패 (status: {resp.status_code})"
         payload = resp.json()
         prices = payload.get("prices", []) if isinstance(payload, dict) else []
         if isinstance(prices, list):
