@@ -14,6 +14,7 @@ from coin_data import (
     save_candidates,
     save_state,
     utc_now_iso,
+    has_cmc_api_key,
 )
 from coin_logic import (
     compute_ma_status,
@@ -25,6 +26,10 @@ from coin_logic import (
 
 st.set_page_config(page_title="COIN Screener v1", layout="wide")
 st.title("COIN Screener v1")
+
+if not has_cmc_api_key():
+    st.warning("CMC_API_KEY 환경변수를 설정해주세요. 앱 실행을 중단합니다.")
+    st.stop()
 
 MAX_CANDIDATES = 10
 
@@ -75,8 +80,8 @@ def run_scan(max_scan_batches: int) -> None:
 
 
 def load_market_mode() -> Dict[str, str]:
-    btc_prices, btc_err = fetch_daily_market_chart("BTCUSDT", days=400)
-    eth_prices, eth_err = fetch_daily_market_chart("ETHUSDT", days=400)
+    btc_prices, btc_err = fetch_daily_market_chart("BTC", days=400)
+    eth_prices, eth_err = fetch_daily_market_chart("ETH", days=400)
 
     if btc_err:
         st.warning(btc_err)
@@ -145,7 +150,7 @@ panel2.metric("ETH 상태", market["eth_status"])
 panel3.metric("최종 모드", market["mode"])
 
 st.caption(
-    f"마지막 업데이트(UTC): {state.get('last_updated_utc') or '-'} | 데이터 소스: Binance Public API"
+    f"마지막 업데이트(UTC): {state.get('last_updated_utc') or '-'} | 데이터 소스: CoinMarketCap API"
 )
 
 render_candidates(mode=market["mode"])

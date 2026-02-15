@@ -1,20 +1,16 @@
 import json
-from datetime import datetime, timezone
+import os
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
 
-BINANCE_BASE = "https://api1.binance.com/api/v3"
-BINANCE_FALLBACK_BASES = [
-    "https://api1.binance.com/api/v3",
-    "https://api2.binance.com/api/v3",
-    "https://api3.binance.com/api/v3",
-]
+CMC_BASE = "https://pro-api.coinmarketcap.com"
 STATE_FILE = Path("state.json")
 CANDIDATES_FILE = Path("candidates.json")
-BINANCE_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 DEFAULT_STATE = {
     "last_page": 1,
@@ -104,122 +100,145 @@ def reset_candidates() -> None:
     _write_json(CANDIDATES_FILE, [])
 
 
-def _get_binance(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[requests.Response], str]:
-    last_base = BINANCE_FALLBACK_BASES[0]
-    for base in BINANCE_FALLBACK_BASES:
-        last_base = base
-        url = f"{base}{path}"
+def get_cmc_headers() -> Optional[Dict[str, str]]:
+    key = os.getenv("CMC_API_KEY")
+    if not key:
+        st.warning("CMC_API_KEY 환경변수가 없습니다. Render 환경변수에 API 키를 설정해주세요.")
+        return None
+    return {
+        "X-CMC_PRO_API_KEY": key,
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+
+def has_cmc_api_key() -> bool:
+    return bool(os.getenv("CMC_API_KEY"))
+
+
+def _cmc_get(endpoint: str, params: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    headers = get_cmc_headers()
+    if headers is None:
+        return None, "CMC API 키가 없어 데이터를 조회할 수 없습니다."
+
+    url = f"{CMC_BASE}{endpoint}"
+    retries = 3
+    for i in range(retries):
         try:
-            resp = requests.get(url, params=params, headers=BINANCE_HEADERS, timeout=10)
-            if resp.status_code == 451 and base != BINANCE_FALLBACK_BASES[-1]:
-                st.warning(f"Binance 지역 제한(451) 감지: {base} -> 다음 엔드포인트 재시도")
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            if resp.status_code == 429 and i < retries - 1:
+                time.sleep(1.5 * (2**i))
                 continue
-            return resp, base
+            if resp.status_code != 200:
+                st.warning(f"CMC {endpoint} 응답 코드: {resp.status_code}")
+                return None, f"CMC {endpoint} 조회 실패 (status: {resp.status_code})"
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                return None, f"CMC {endpoint} 응답 형식이 올바르지 않습니다."
+            return payload, None
         except requests.RequestException:
-            if base != BINANCE_FALLBACK_BASES[-1]:
+            if i < retries - 1:
+                time.sleep(1.5 * (2**i))
                 continue
-            raise
-    return None, last_base
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_symbols() -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    try:
-        resp, used_base = _get_binance("/exchangeInfo")
-        if resp is None or resp.status_code != 200:
-            status = "N/A" if resp is None else resp.status_code
-            st.warning(f"Binance /exchangeInfo 응답 코드: {status} ({used_base})")
-            return [], f"거래심볼 조회 실패 (status: {status})"
-        payload = resp.json()
-        symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
-        if not isinstance(symbols, list):
-            return [], "거래심볼 데이터 형식이 올바르지 않습니다."
-
-        tradable = [
-            s
-            for s in symbols
-            if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"
-        ]
-        return tradable, None
-    except requests.RequestException:
-        return [], "Binance 거래심볼을 가져오지 못했습니다. 잠시 후 다시 시도해주세요."
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_ticker_24h_map() -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-    try:
-        resp, used_base = _get_binance("/ticker/24hr")
-        if resp is None or resp.status_code != 200:
-            status = "N/A" if resp is None else resp.status_code
-            st.warning(f"Binance /ticker/24hr 응답 코드: {status} ({used_base})")
-            return {}, f"24시간 변동률 조회 실패 (status: {status})"
-        rows = resp.json()
-        if not isinstance(rows, list):
-            return {}, "24시간 변동률 데이터 형식이 올바르지 않습니다."
-        return {str(r.get("symbol", "")): r for r in rows}, None
-    except requests.RequestException:
-        return {}, "Binance 24시간 변동률을 가져오지 못했습니다."
+            return None, f"CMC {endpoint} 요청 중 네트워크 오류가 발생했습니다."
+    return None, f"CMC {endpoint} 조회에 실패했습니다."
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_markets_page(page: int, per_page: int = 100, vs_currency: str = "usd") -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    symbols, sym_err = fetch_symbols()
-    if sym_err:
-        return [], sym_err
+    endpoint = "/v1/cryptocurrency/listings/latest"
+    start = 1 + (max(page, 1) - 1) * per_page
+    params = {
+        "start": start,
+        "limit": per_page,
+        "convert": "USD",
+    }
+    payload, err = _cmc_get(endpoint, params)
+    if err:
+        return [], err
 
-    ticker_map, ticker_err = fetch_ticker_24h_map()
-    if ticker_err:
-        st.warning(ticker_err)
-
-    start = max(page - 1, 0) * per_page
-    end = start + per_page
-    page_symbols = symbols[start:end]
-    if not page_symbols:
-        return [], None
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    if not isinstance(data, list):
+        return [], "시장 데이터 형식이 올바르지 않습니다."
 
     out: List[Dict[str, Any]] = []
-    for idx, s in enumerate(page_symbols, start=start + 1):
-        symbol = str(s.get("symbol", ""))
-        ticker = ticker_map.get(symbol, {})
-        price_change = ticker.get("priceChangePercent")
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        quote = row.get("quote", {}).get("USD", {}) if isinstance(row.get("quote"), dict) else {}
         out.append(
             {
-                "market_cap_rank": idx,
-                "id": symbol,
-                "symbol": symbol,
-                "name": symbol,
-                "market_cap": None,
-                "price_change_percentage_24h": float(price_change) if price_change is not None else None,
+                "market_cap_rank": row.get("cmc_rank"),
+                "id": row.get("id"),
+                "symbol": str(row.get("symbol", "")),
+                "name": row.get("name"),
+                "market_cap": quote.get("market_cap"),
+                "price_change_percentage_24h": quote.get("percent_change_24h"),
             }
         )
     return out, None
 
 
+def _extract_quotes_from_ohlcv_data(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, dict):
+        if "quotes" in data and isinstance(data["quotes"], list):
+            return [q for q in data["quotes"] if isinstance(q, dict)]
+        quotes: List[Dict[str, Any]] = []
+        for v in data.values():
+            quotes.extend(_extract_quotes_from_ohlcv_data(v))
+        return quotes
+    if isinstance(data, list):
+        quotes: List[Dict[str, Any]] = []
+        for v in data:
+            quotes.extend(_extract_quotes_from_ohlcv_data(v))
+        return quotes
+    return []
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_daily_market_chart(coin_id: str, days: int = 400, vs_currency: str = "usd") -> Tuple[List[List[float]], Optional[str]]:
-    params = {
-        "symbol": str(coin_id).upper(),
-        "interval": "1d",
-        "limit": 400,
+    endpoint = "/v2/cryptocurrency/ohlcv/historical"
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=max(200, min(days, 400)) + 10)
+    params: Dict[str, Any] = {
+        "time_start": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "time_end": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "interval": "daily",
+        "count": max(200, min(days, 400)),
+        "convert": "USD",
     }
-    try:
-        resp, used_base = _get_binance("/klines", params=params)
-        if resp is None or resp.status_code != 200:
-            status = "N/A" if resp is None else resp.status_code
-            st.warning(f"Binance /klines/{coin_id} 응답 코드: {status} ({used_base})")
-            return [], f"{str(coin_id).upper()} 일봉 데이터 조회 실패 (status: {status})"
-        rows = resp.json()
-        if not isinstance(rows, list):
-            return [], f"{str(coin_id).upper()} 일봉 데이터 형식이 올바르지 않습니다."
 
-        prices: List[List[float]] = []
-        for r in rows:
-            if not isinstance(r, list) or len(r) < 5:
-                continue
-            prices.append([float(r[0]), float(r[4])])
-        return prices, None
-    except requests.RequestException:
-        return [], f"{str(coin_id).upper()} 일봉 데이터를 가져오지 못했습니다."
+    coin_text = str(coin_id)
+    if coin_text.isdigit():
+        params["id"] = coin_text
+    else:
+        params["symbol"] = coin_text.upper()
+
+    payload, err = _cmc_get(endpoint, params)
+    if err:
+        return [], err
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    quotes = _extract_quotes_from_ohlcv_data(data)
+    if not quotes:
+        st.warning(f"CMC {endpoint} 데이터 없음: {coin_id}")
+        return [], f"CMC {endpoint}에서 {coin_id} 일봉 데이터를 받지 못했습니다."
+
+    prices: List[List[float]] = []
+    for q in quotes:
+        t = q.get("timestamp")
+        close = q.get("quote", {}).get("USD", {}).get("close")
+        if t is None or close is None:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+            ts_ms = int(dt.timestamp() * 1000)
+            prices.append([float(ts_ms), float(close)])
+        except Exception:
+            continue
+
+    prices.sort(key=lambda x: x[0])
+    return prices[-400:], None
 
 
 def is_stablecoin(coin: Dict[str, Any]) -> bool:
