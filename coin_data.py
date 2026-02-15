@@ -6,7 +6,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 
-BINANCE_BASE = "https://api.binance.com/api/v3"
+BINANCE_BASE = "https://api1.binance.com/api/v3"
+BINANCE_FALLBACK_BASES = [
+    "https://api1.binance.com/api/v3",
+    "https://api2.binance.com/api/v3",
+    "https://api3.binance.com/api/v3",
+]
 STATE_FILE = Path("state.json")
 CANDIDATES_FILE = Path("candidates.json")
 BINANCE_HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -99,14 +104,32 @@ def reset_candidates() -> None:
     _write_json(CANDIDATES_FILE, [])
 
 
+def _get_binance(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[requests.Response], str]:
+    last_base = BINANCE_FALLBACK_BASES[0]
+    for base in BINANCE_FALLBACK_BASES:
+        last_base = base
+        url = f"{base}{path}"
+        try:
+            resp = requests.get(url, params=params, headers=BINANCE_HEADERS, timeout=10)
+            if resp.status_code == 451 and base != BINANCE_FALLBACK_BASES[-1]:
+                st.warning(f"Binance 지역 제한(451) 감지: {base} -> 다음 엔드포인트 재시도")
+                continue
+            return resp, base
+        except requests.RequestException:
+            if base != BINANCE_FALLBACK_BASES[-1]:
+                continue
+            raise
+    return None, last_base
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_symbols() -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    url = f"{BINANCE_BASE}/exchangeInfo"
     try:
-        resp = requests.get(url, headers=BINANCE_HEADERS, timeout=10)
-        if resp.status_code != 200:
-            st.warning(f"Binance /exchangeInfo 응답 코드: {resp.status_code}")
-            return [], f"거래심볼 조회 실패 (status: {resp.status_code})"
+        resp, used_base = _get_binance("/exchangeInfo")
+        if resp is None or resp.status_code != 200:
+            status = "N/A" if resp is None else resp.status_code
+            st.warning(f"Binance /exchangeInfo 응답 코드: {status} ({used_base})")
+            return [], f"거래심볼 조회 실패 (status: {status})"
         payload = resp.json()
         symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
         if not isinstance(symbols, list):
@@ -124,12 +147,12 @@ def fetch_symbols() -> Tuple[List[Dict[str, Any]], Optional[str]]:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_ticker_24h_map() -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-    url = f"{BINANCE_BASE}/ticker/24hr"
     try:
-        resp = requests.get(url, headers=BINANCE_HEADERS, timeout=10)
-        if resp.status_code != 200:
-            st.warning(f"Binance /ticker/24hr 응답 코드: {resp.status_code}")
-            return {}, f"24시간 변동률 조회 실패 (status: {resp.status_code})"
+        resp, used_base = _get_binance("/ticker/24hr")
+        if resp is None or resp.status_code != 200:
+            status = "N/A" if resp is None else resp.status_code
+            st.warning(f"Binance /ticker/24hr 응답 코드: {status} ({used_base})")
+            return {}, f"24시간 변동률 조회 실패 (status: {status})"
         rows = resp.json()
         if not isinstance(rows, list):
             return {}, "24시간 변동률 데이터 형식이 올바르지 않습니다."
@@ -174,17 +197,17 @@ def fetch_markets_page(page: int, per_page: int = 100, vs_currency: str = "usd")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_daily_market_chart(coin_id: str, days: int = 400, vs_currency: str = "usd") -> Tuple[List[List[float]], Optional[str]]:
-    url = f"{BINANCE_BASE}/klines"
     params = {
         "symbol": str(coin_id).upper(),
         "interval": "1d",
         "limit": 400,
     }
     try:
-        resp = requests.get(url, params=params, headers=BINANCE_HEADERS, timeout=10)
-        if resp.status_code != 200:
-            st.warning(f"Binance /klines/{coin_id} 응답 코드: {resp.status_code}")
-            return [], f"{str(coin_id).upper()} 일봉 데이터 조회 실패 (status: {resp.status_code})"
+        resp, used_base = _get_binance("/klines", params=params)
+        if resp is None or resp.status_code != 200:
+            status = "N/A" if resp is None else resp.status_code
+            st.warning(f"Binance /klines/{coin_id} 응답 코드: {status} ({used_base})")
+            return [], f"{str(coin_id).upper()} 일봉 데이터 조회 실패 (status: {status})"
         rows = resp.json()
         if not isinstance(rows, list):
             return [], f"{str(coin_id).upper()} 일봉 데이터 형식이 올바르지 않습니다."
