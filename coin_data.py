@@ -6,10 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+BINANCE_BASE = "https://api.binance.com/api/v3"
 STATE_FILE = Path("state.json")
 CANDIDATES_FILE = Path("candidates.json")
-COINGECKO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+BINANCE_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 DEFAULT_STATE = {
     "last_page": 1,
@@ -100,51 +100,103 @@ def reset_candidates() -> None:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_markets_page(page: int, per_page: int = 100, vs_currency: str = "usd") -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """CoinGecko endpoint: /coins/markets"""
-    url = f"{COINGECKO_BASE}/coins/markets"
-    params = {
-        "vs_currency": vs_currency,
-        "order": "market_cap_desc",
-        "per_page": per_page,
-        "page": page,
-        "sparkline": "false",
-        "price_change_percentage": "24h",
-    }
+def fetch_symbols() -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    url = f"{BINANCE_BASE}/exchangeInfo"
     try:
-        resp = requests.get(url, params=params, headers=COINGECKO_HEADERS, timeout=10)
+        resp = requests.get(url, headers=BINANCE_HEADERS, timeout=10)
         if resp.status_code != 200:
-            st.warning(f"CoinGecko /coins/markets 응답 코드: {resp.status_code}")
-            return [], f"CoinGecko 시장 데이터 조회 실패 (status: {resp.status_code})"
-        data = resp.json()
-        if isinstance(data, list):
-            return data, None
-        return [], "시장 데이터 형식이 올바르지 않습니다."
+            st.warning(f"Binance /exchangeInfo 응답 코드: {resp.status_code}")
+            return [], f"거래심볼 조회 실패 (status: {resp.status_code})"
+        payload = resp.json()
+        symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
+        if not isinstance(symbols, list):
+            return [], "거래심볼 데이터 형식이 올바르지 않습니다."
+
+        tradable = [
+            s
+            for s in symbols
+            if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"
+        ]
+        return tradable, None
     except requests.RequestException:
-        return [], "CoinGecko 시장 데이터를 가져오지 못했습니다. 잠시 후 다시 시도해주세요."
+        return [], "Binance 거래심볼을 가져오지 못했습니다. 잠시 후 다시 시도해주세요."
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_ticker_24h_map() -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    url = f"{BINANCE_BASE}/ticker/24hr"
+    try:
+        resp = requests.get(url, headers=BINANCE_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            st.warning(f"Binance /ticker/24hr 응답 코드: {resp.status_code}")
+            return {}, f"24시간 변동률 조회 실패 (status: {resp.status_code})"
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return {}, "24시간 변동률 데이터 형식이 올바르지 않습니다."
+        return {str(r.get("symbol", "")): r for r in rows}, None
+    except requests.RequestException:
+        return {}, "Binance 24시간 변동률을 가져오지 못했습니다."
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_markets_page(page: int, per_page: int = 100, vs_currency: str = "usd") -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    symbols, sym_err = fetch_symbols()
+    if sym_err:
+        return [], sym_err
+
+    ticker_map, ticker_err = fetch_ticker_24h_map()
+    if ticker_err:
+        st.warning(ticker_err)
+
+    start = max(page - 1, 0) * per_page
+    end = start + per_page
+    page_symbols = symbols[start:end]
+    if not page_symbols:
+        return [], None
+
+    out: List[Dict[str, Any]] = []
+    for idx, s in enumerate(page_symbols, start=start + 1):
+        symbol = str(s.get("symbol", ""))
+        ticker = ticker_map.get(symbol, {})
+        price_change = ticker.get("priceChangePercent")
+        out.append(
+            {
+                "market_cap_rank": idx,
+                "id": symbol,
+                "symbol": symbol,
+                "name": symbol,
+                "market_cap": None,
+                "price_change_percentage_24h": float(price_change) if price_change is not None else None,
+            }
+        )
+    return out, None
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_daily_market_chart(coin_id: str, days: int = 400, vs_currency: str = "usd") -> Tuple[List[List[float]], Optional[str]]:
-    """CoinGecko endpoint: /coins/{id}/market_chart"""
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
+    url = f"{BINANCE_BASE}/klines"
     params = {
-        "vs_currency": "usd",
-        "days": 365,
-        "interval": "daily",
+        "symbol": str(coin_id).upper(),
+        "interval": "1d",
+        "limit": 400,
     }
     try:
-        resp = requests.get(url, params=params, headers=COINGECKO_HEADERS, timeout=10)
+        resp = requests.get(url, params=params, headers=BINANCE_HEADERS, timeout=10)
         if resp.status_code != 200:
-            st.warning(f"CoinGecko /coins/{coin_id}/market_chart 응답 코드: {resp.status_code}")
-            return [], f"{coin_id.upper()} 일봉 데이터 조회 실패 (status: {resp.status_code})"
-        payload = resp.json()
-        prices = payload.get("prices", []) if isinstance(payload, dict) else []
-        if isinstance(prices, list):
-            return prices, None
-        return [], f"{coin_id.upper()} 일봉 데이터 형식이 올바르지 않습니다."
+            st.warning(f"Binance /klines/{coin_id} 응답 코드: {resp.status_code}")
+            return [], f"{str(coin_id).upper()} 일봉 데이터 조회 실패 (status: {resp.status_code})"
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return [], f"{str(coin_id).upper()} 일봉 데이터 형식이 올바르지 않습니다."
+
+        prices: List[List[float]] = []
+        for r in rows:
+            if not isinstance(r, list) or len(r) < 5:
+                continue
+            prices.append([float(r[0]), float(r[4])])
+        return prices, None
     except requests.RequestException:
-        return [], f"{coin_id.upper()} 일봉 데이터를 가져오지 못했습니다."
+        return [], f"{str(coin_id).upper()} 일봉 데이터를 가져오지 못했습니다."
 
 
 def is_stablecoin(coin: Dict[str, Any]) -> bool:

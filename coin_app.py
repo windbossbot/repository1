@@ -75,8 +75,8 @@ def run_scan(max_scan_batches: int) -> None:
 
 
 def load_market_mode() -> Dict[str, str]:
-    btc_prices, btc_err = fetch_daily_market_chart("bitcoin", days=400)
-    eth_prices, eth_err = fetch_daily_market_chart("ethereum", days=400)
+    btc_prices, btc_err = fetch_daily_market_chart("BTCUSDT", days=400)
+    eth_prices, eth_err = fetch_daily_market_chart("ETHUSDT", days=400)
 
     if btc_err:
         st.warning(btc_err)
@@ -145,7 +145,7 @@ panel2.metric("ETH 상태", market["eth_status"])
 panel3.metric("최종 모드", market["mode"])
 
 st.caption(
-    f"마지막 업데이트(UTC): {state.get('last_updated_utc') or '-'} | 데이터 소스: CoinGecko"
+    f"마지막 업데이트(UTC): {state.get('last_updated_utc') or '-'} | 데이터 소스: Binance Public API"
 )
 
 render_candidates(mode=market["mode"])
