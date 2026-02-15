@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: coin-screener
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run coin_app.py --server.port $PORT --server.address 0.0.0.0"
