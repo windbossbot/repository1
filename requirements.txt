@@ -7,5 +7,3 @@ ccxt==4.4.45
 pandas==2.2.3
 pykrx==1.0.48
 yfinance==0.2.54
-streamlit
-numpy

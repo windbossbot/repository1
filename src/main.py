@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pandas as pd
+import yfinance as yf
 
 from .data_crypto import fetch_crypto_daily_close, fetch_crypto_mcap_usd
 from .data_us import fetch_daily_ohlcv_batch, fetch_market_cap
@@ -37,16 +41,134 @@ def _state_default() -> dict:
     }
 
 
-def _benchmark_score_us(symbols: list[str]) -> tuple[str, int]:
-    data = fetch_daily_ohlcv_batch(symbols, years=5)
-    for symbol in symbols:
-        frame = data.get(symbol)
-        if frame is None or frame.empty:
+def _benchmark_cache_path(group: str) -> Path:
+    return DATA / f"cache_benchmark_{group.upper()}.json"
+
+
+def _serialize_daily_close(df: pd.DataFrame) -> list[dict]:
+    out = []
+    for ts, row in df.sort_index().iterrows():
+        c = row.get("Close")
+        if pd.isna(c):
             continue
-        score = compute_score(rebuild_weekly_from_daily_close(frame, source_tz="UTC"))
+        out.append({"ts": pd.Timestamp(ts).isoformat(), "close": float(c)})
+    return out
+
+
+def _deserialize_daily_close(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["Close"])
+    frame = pd.DataFrame(rows)
+    frame["ts"] = pd.to_datetime(frame["ts"], utc=False)
+    frame = frame.set_index("ts").sort_index()
+    return pd.DataFrame({"Close": pd.to_numeric(frame["close"], errors="coerce")}).dropna()
+
+
+def _fetch_yf_daily_with_retry(symbol: str, min_days: int = 900) -> pd.DataFrame:
+    start = (datetime.utcnow() - timedelta(days=365 * 6)).strftime("%Y-%m-%d")
+    delays = [1, 2, 4]
+    last_exc: Exception | None = None
+    for i in range(len(delays)):
+        try:
+            data = yf.download(
+                tickers=symbol,
+                start=start,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                group_by="ticker",
+            )
+            if isinstance(data.columns, pd.MultiIndex):
+                if symbol in data.columns.get_level_values(0):
+                    data = data[symbol]
+            data = data.rename(columns=str.title)
+            if "Close" not in data.columns:
+                raise ValueError("missing Close column")
+            data = data[["Close"]].dropna()
+            if len(data) < min_days:
+                raise ValueError(f"insufficient rows: {len(data)} < {min_days}")
+            return data
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(delays[i])
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"failed to fetch {symbol}")
+
+
+def _load_benchmark_cache(group: str) -> tuple[pd.DataFrame, str] | tuple[None, None]:
+    cached = load_json(_benchmark_cache_path(group), default={})
+    rows = cached.get("rows") if isinstance(cached, dict) else None
+    if not rows:
+        return None, None
+    df = _deserialize_daily_close(rows)
+    if df.empty:
+        return None, None
+    return df, str(cached.get("symbol", "CACHE"))
+
+
+def _save_benchmark_cache(group: str, symbol: str, daily_close: pd.DataFrame) -> None:
+    save_json(
+        _benchmark_cache_path(group),
+        {
+            "group": group,
+            "symbol": symbol,
+            "asof_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "rows": _serialize_daily_close(daily_close),
+        },
+    )
+
+
+def _benchmark_score_us(symbols: list[str], group: str) -> tuple[str, int]:
+    attempted = []
+    last_exc: Exception | None = None
+    cache_exists = _benchmark_cache_path(group).exists()
+
+    use_symbols = list(symbols)
+    if group.upper() == "KOSPI":
+        use_symbols = ["^KS11", "KOSPI.KS", "069500.KS"]
+
+    for symbol in use_symbols:
+        attempted.append(symbol)
+        try:
+            daily = _fetch_yf_daily_with_retry(symbol, min_days=900)
+            score = compute_score(rebuild_weekly_from_daily_close(daily, source_tz="UTC"))
+            if score is not None:
+                _save_benchmark_cache(group, symbol, daily)
+                return symbol, score
+            last_exc = RuntimeError("score unavailable due to insufficient weekly history")
+        except Exception as exc:
+            last_exc = exc
+
+    cached_df, cached_symbol = _load_benchmark_cache(group)
+    if cached_df is not None:
+        score = compute_score(rebuild_weekly_from_daily_close(cached_df, source_tz="UTC"))
         if score is not None:
-            return symbol, score
-    raise RuntimeError(f"No benchmark data for {symbols}")
+            return cached_symbol or "CACHE", score
+
+    if group.upper() == "KOSPI":
+        try:
+            from pykrx import stock
+
+            end = datetime.now().strftime("%Y%m%d")
+            start = (datetime.now() - timedelta(days=365 * 6)).strftime("%Y%m%d")
+            idx_df = stock.get_index_ohlcv_by_date(start, end, "1001")
+            if not idx_df.empty and "종가" in idx_df.columns:
+                proxy = pd.DataFrame({"Close": pd.to_numeric(idx_df["종가"], errors="coerce")}).dropna()
+                proxy.index = pd.to_datetime(proxy.index)
+                score = compute_score(rebuild_weekly_from_daily_close(proxy, source_tz="Asia/Seoul"))
+                if score is not None:
+                    _save_benchmark_cache(group, "KOSPI_INDEX_1001", proxy)
+                    return "KOSPI_INDEX_1001", score
+        except Exception as exc:
+            last_exc = exc
+
+    raise RuntimeError(
+        f"Benchmark fetch failed for group={group}; attempted_tickers={attempted}; "
+        f"cache_exists={cache_exists}; last_exception={repr(last_exc)}; "
+        "yfinance blocked/unavailable; try again later or use cached benchmark"
+    )
 
 
 def _crypto_benchmark_score() -> int:
@@ -166,8 +288,8 @@ def _prepare_group_lists(usdkrw: float) -> dict:
 def generate_page(page_num: int, state: dict) -> dict:
     usdkrw = get_usdkrw(FX_CACHE)
 
-    kospi_benchmark, kospi_score = _benchmark_score_us(["^KS11", "069500.KS"])
-    nasdaq_benchmark, nasdaq_score = _benchmark_score_us(["^IXIC"])
+    kospi_benchmark, kospi_score = _benchmark_score_us(["^KS11", "KOSPI.KS", "069500.KS"], group="KOSPI")
+    nasdaq_benchmark, nasdaq_score = _benchmark_score_us(["^IXIC"], group="NASDAQ")
     crypto_score = _crypto_benchmark_score()
 
     groups = [
