@@ -3,4 +3,4 @@ services:
     name: coin-screener
     runtime: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "streamlit run coin_app.py --server.port $PORT --server.address 0.0.0.0"
+    startCommand: "gunicorn app:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 120"
