@@ -6,7 +6,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -17,10 +16,8 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run main screener
+      - name: Run screener -> MA filter (one-shot)
         env:
           DATA_GO_KR_SERVICE_KEY: ${{ secrets.DATA_GO_KR_SERVICE_KEY }}
-        run: python main.py
-
-      - name: Run MA hierarchical filter
-        run: python ma_filter.py
+        run: |
+          python main.py | python ma_filter.py
