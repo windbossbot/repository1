@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 from datetime import datetime, timedelta
 
@@ -9,93 +10,80 @@ import FinanceDataReader as fdr
 SMA_N = 120
 LOOKBACK_YEARS = 15
 
-# 디버그: 실패 사유를 stderr로 찍고 싶으면 True
-DEBUG = True
-
 
 def sma_last(series: pd.Series, n: int):
     if series is None or len(series) < n:
         return None
-    return series.rolling(n).mean().iloc[-1]
+    v = series.rolling(n).mean().iloc[-1]
+    # NaN이면 "없음"으로 취급 → 다음 단계로 넘김(=없으면 통과 로직의 핵심)
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    return float(v)
 
 
 def resample_close(df: pd.DataFrame, rule: str) -> pd.Series:
-    # df index must be DatetimeIndex
     return df["Close"].resample(rule).last().dropna()
 
 
-def decide(df: pd.DataFrame) -> bool:
+def decide(df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Returns (passed?, used_level)
+    used_level: 'M' / 'W' / 'D' / 'NO120'
+    """
     close = float(df["Close"].iloc[-1])
 
-    # 1) 120개월선 (가능하면 최우선)
-    m = resample_close(df, "ME")  # pandas 최신: "M" 대신 "ME"
+    # 1) 120월봉이 "있으면" 여기서 결정 (없으면 다음으로)
+    m = resample_close(df, "ME")  # month-end
     m_sma = sma_last(m, SMA_N)
     if m_sma is not None:
-        return close > float(m_sma)
+        return (close > m_sma, "M")
 
-    # 2) 120주봉선 (없으면 주봉)
+    # 2) 120주봉이 "있으면" 여기서 결정
     w = resample_close(df, "W-FRI")
     w_sma = sma_last(w, SMA_N)
     if w_sma is not None:
-        return close > float(w_sma)
+        return (close > w_sma, "W")
 
-    # 3) 120일선 (그것도 없으면 일봉)
+    # 3) 120일선이 "있으면" 여기서 결정
     d_sma = sma_last(df["Close"], SMA_N)
     if d_sma is not None:
-        return close > float(d_sma)
+        return (close > d_sma, "D")
 
-    # 120 자체가 없으면 통과(요청하신 "없으면 통과" 방식)
-    return True
+    # 120 자체가 없으면 통과(요청대로)
+    return (True, "NO120")
 
 
 def read_codes_from_stdin() -> list[str]:
+    # main.py 출력에서 "6자리 숫자 코드"만 통과
     codes: list[str] = []
     for line in sys.stdin:
         c = line.strip()
         if not c:
             continue
-
-        # 숫자만 남기기: '005930' 또는 '5930' 같은 경우만 허용
-        # 'TOTAL_COUNT=..', 'PASSED: ..', 에러문, 경로 등은 전부 버림
-        if not c.replace(" ", "").isdigit():
+        # TOTAL_COUNT=... 같은 줄 제외
+        if c.startswith("TOTAL_COUNT="):
             continue
-
-        c = c.replace(" ", "")
+        # 숫자만 허용
+        if not c.isdigit():
+            continue
         if len(c) > 6:
             continue
-
         codes.append(c.zfill(6))
     return codes
 
 
-def fetch_df_krx(code6: str, start: str) -> pd.DataFrame | None:
-    """
-    FinanceDataReader가 환경/버전에 따라 입력 포맷에 민감해서
-    여러 포맷을 순차로 시도합니다.
-    """
-    candidates = [
-        code6,            # "005930"
-        f"KRX:{code6}",   # "KRX:005930" (일부 환경에서 필요)
-    ]
-
-    last_err = None
-    for sym in candidates:
+def fetch_df(code6: str, start: str) -> pd.DataFrame | None:
+    # 환경 따라 KRX: 접두가 필요할 수 있어 2개 시도
+    for sym in (code6, f"KRX:{code6}"):
         try:
             df = fdr.DataReader(sym, start)
-            if df is None or df.empty:
-                last_err = f"EMPTY({sym})"
-                continue
-            if "Close" not in df.columns:
-                last_err = f"NO_CLOSE({sym})"
+            if df is None or df.empty or "Close" not in df.columns:
                 continue
             df = df.copy()
             df.index = pd.to_datetime(df.index)
             return df
-        except Exception as e:
-            last_err = f"{type(e).__name__}({sym}): {str(e)[:160]}"
-
-    if DEBUG and last_err:
-        print(f"ERR {code6}: {last_err}", file=sys.stderr)
+        except Exception:
+            continue
     return None
 
 
@@ -107,21 +95,27 @@ def main() -> int:
 
     start = (datetime.today() - timedelta(days=365 * LOOKBACK_YEARS)).strftime("%Y-%m-%d")
 
-    passed = 0
+    passed_codes: list[str] = []
+    stats = {"M": 0, "W": 0, "D": 0, "NO120": 0, "NO_DATA": 0}
+
     for code in codes:
-        df = fetch_df_krx(code, start)
+        df = fetch_df(code, start)
         if df is None:
-            continue
-        try:
-            if decide(df):
-                print(code)  # 통과 종목코드 출력
-                passed += 1
-        except Exception as e:
-            if DEBUG:
-                print(f"ERR_DECIDE {code}: {type(e).__name__} {str(e)[:160]}", file=sys.stderr)
+            stats["NO_DATA"] += 1
             continue
 
-    print(f"PASSED: {passed}")
+        ok, lvl = decide(df)
+        stats[lvl] += 1
+        if ok:
+            passed_codes.append(code)
+
+    # 통과 종목 출력
+    for c in passed_codes:
+        print(c)
+
+    # 요약
+    print(f"PASSED: {len(passed_codes)}")
+    print(f"STATS M={stats['M']} W={stats['W']} D={stats['D']} NO120={stats['NO120']} NO_DATA={stats['NO_DATA']}")
     return 0
 
 
