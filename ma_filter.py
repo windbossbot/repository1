@@ -16,7 +16,7 @@ def resample_close(df, rule):
 def decide(df):
     close = df["Close"].iloc[-1]
 
-    m = resample_close(df, "M")
+    m = resample_close(df, "ME")
     m_sma = sma_last(m, SMA_N)
     if m_sma is not None:
         return close > m_sma
