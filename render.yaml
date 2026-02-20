@@ -1,6 +1,9 @@
 services:
-  - type: web
-    name: coin-screener
+  - type: worker
+    name: krx-filter-worker
     runtime: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 120"
+    buildCommand: "python -m pip install -r requirements.txt"
+    startCommand: "python main.py | python ma_filter.py"
+    envVars:
+      - key: DATA_GO_KR_SERVICE_KEY
+        sync: false
