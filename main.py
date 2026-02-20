@@ -12,8 +12,10 @@ REQUEST_TIMEOUT = 20
 PAGE_SIZE = 1000
 MAX_BACKTRACK_DAYS = 20
 
+MIN_PRICE = 2_000
 MAX_PRICE = 300_000
-MIN_DAILY_TRADE_VALUE = 3_000_000_000
+MIN_VOLUME = 100_000
+MIN_DAILY_TRADE_VALUE = 5_000_000_000
 
 
 def to_int(value: object, default: int = 0) -> int:
@@ -100,10 +102,13 @@ class KRXClient:
 
 def passes_stage1(item: Dict[str, object]) -> bool:
     close = first_available(item, ["clpr", "close", "stckClpr"])
-    if close <= 0 or close >= MAX_PRICE:
+    if close < MIN_PRICE or close >= MAX_PRICE:
         return False
 
     volume = first_available(item, ["trqu", "accTrdVol", "volume"])
+    if volume < MIN_VOLUME:
+        return False
+
     trade_value = first_available(item, ["trPrc", "accTrdVal", "tradeValue"])
     if trade_value <= 0:
         trade_value = close * volume
