@@ -49,10 +49,29 @@ def last_sma120(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
     return last_close, float(last_sma)
 
 
+def last_monthly_jump_ratio(close_monthly: pd.Series) -> Optional[float]:
+    if len(close_monthly) < 2:
+        return None
+    prev_close = float(close_monthly.iloc[-2])
+    curr_close = float(close_monthly.iloc[-1])
+    if prev_close <= 0:
+        return None
+    return (curr_close - prev_close) / prev_close
+
+
 def decide_pass(df: pd.DataFrame) -> Tuple[bool, str]:
     close_daily = df["Close"].astype(float)
 
     close_monthly = close_daily.resample("ME").last().dropna()
+
+    # Additional hard exclusions requested:
+    # 1) Exclude if monthly candles are 5 or fewer.
+    # 2) Exclude if the latest monthly gain is greater than 40%.
+    if len(close_monthly) <= 5:
+        return False, "M"
+    monthly_jump = last_monthly_jump_ratio(close_monthly)
+    if monthly_jump is not None and monthly_jump > 0.40:
+        return False, "M"
     monthly_close, monthly_sma = last_sma120(close_monthly)
     if monthly_sma is not None and monthly_close is not None:
         return monthly_close > monthly_sma, "M"
