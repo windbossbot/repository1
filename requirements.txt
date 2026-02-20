@@ -1,8 +1,1 @@
-fastapi
-uvicorn
-gunicorn
-pandas
-numpy
 requests
-yfinance
-lxml
