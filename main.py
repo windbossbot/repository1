@@ -99,24 +99,39 @@ class KRXClient:
 
 
 def passes_stage1(item: Dict[str, object]) -> bool:
-    close = first_available(item, ["clpr", "close", "stckClpr"])
-    if close <= 0 or close >= MAX_PRICE:
+    # 종목명 기반 제외 (SPAC / ETF 등)
+    name = str(item.get("itmsNm", "")).strip().lower()
+
+    # SPAC 제외
+    if "스팩" in name or "spac" in name:
         return False
 
+    # ETF 및 레버리지/인버스 제외
+    if "etf" in name or "레버리지" in name or "인버스" in name:
+        return False
+
+    # 가격 조건
+    close = first_available(item, ["clpr", "close", "stckClpr"])
+    if close < 500 or close >= MAX_PRICE:
+        return False
+
+    # 거래량 / 거래대금
     volume = first_available(item, ["trqu", "accTrdVol", "volume"])
     trade_value = first_available(item, ["trPrc", "accTrdVal", "tradeValue"])
+
     if trade_value <= 0:
         trade_value = close * volume
+
     if trade_value < MIN_DAILY_TRADE_VALUE:
         return False
 
-    # Market cap intentionally skipped when not reliably available from this endpoint.
-
+    # 거래정지 / 관리종목 / 투자주의 제외 (필드 존재 시)
     flag_groups: List[List[str]] = [
         ["haltYn", "trhtYn", "isTradingHalt"],
         ["mgtIssueYn", "admYn", "isManagementIssue"],
         ["invstCautnYn", "investCautionYn", "isInvestmentCaution"],
     ]
+
     for group in flag_groups:
         existing = [key for key in group if key in item]
         if not existing:
