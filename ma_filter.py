@@ -52,7 +52,7 @@ def last_sma120(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
 def decide_pass(df: pd.DataFrame) -> Tuple[bool, str]:
     close_daily = df["Close"].astype(float)
 
-    close_monthly = close_daily.resample("M").last().dropna()
+    close_monthly = close_daily.resample("ME").last().dropna()
     monthly_close, monthly_sma = last_sma120(close_monthly)
     if monthly_sma is not None and monthly_close is not None:
         return monthly_close > monthly_sma, "M"
