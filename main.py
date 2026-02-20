@@ -1,186 +1,76 @@
-from __future__ import annotations
-
-import os
 import sys
-from datetime import date, timedelta
-from typing import Dict, Iterable, Iterator, List
+from datetime import datetime, timedelta
 
-import requests
+import pandas as pd
+import FinanceDataReader as fdr
 
-API_URL = "https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/getStockPriceInfo"
-REQUEST_TIMEOUT = 20
-PAGE_SIZE = 1000
-MAX_BACKTRACK_DAYS = 20
-
-# Filters (user requested)
-MAX_PRICE = 300_000                 # close < 300,000
-MIN_PRICE = 500                     # close >= 500
-MAX_HIGH_PRICE = 200_000            # high <= 200,000
-MIN_VOLUME = 50_000                 # volume >= 50,000
-MIN_DAILY_TRADE_VALUE = 5_000_000_000  # 50억
+SMA_N = 120
 
 
-def to_int(value: object, default: int = 0) -> int:
-    if value is None:
-        return default
-    text = str(value).strip().replace(",", "")
-    if not text:
-        return default
-    try:
-        return int(float(text))
-    except (TypeError, ValueError):
-        return default
+def sma_last(series: pd.Series, n: int):
+    if len(series) < n:
+        return None
+    return series.rolling(n).mean().iloc[-1]
 
 
-def first_available(item: Dict[str, object], candidates: Iterable[str], default: int = 0) -> int:
-    for key in candidates:
-        if key in item:
-            return to_int(item.get(key), default)
-    return default
+def resample_close(df: pd.DataFrame, rule: str) -> pd.Series:
+    return df["Close"].resample(rule).last().dropna()
 
 
-def is_flagged(value: object) -> bool:
-    if value is None:
-        return False
-    text = str(value).strip().lower()
-    if not text:
-        return False
-    return text not in {"n", "0", "false", "f", "정상", "해당없음", "none"}
+def decide(df: pd.DataFrame) -> bool:
+    close = float(df["Close"].iloc[-1])
 
+    # 1) 120 month SMA (if exists)
+    m = resample_close(df, "ME")
+    m_sma = sma_last(m, SMA_N)
+    if m_sma is not None:
+        return close > float(m_sma)
 
-class KRXClient:
-    def __init__(self, service_key: str) -> None:
-        self.service_key = service_key
-        self.session = requests.Session()
+    # 2) 120 week SMA (if exists)
+    w = resample_close(df, "W-FRI")
+    w_sma = sma_last(w, SMA_N)
+    if w_sma is not None:
+        return close > float(w_sma)
 
-    def request_page(self, bas_dt: str, page_no: int) -> Dict[str, object]:
-        params = {
-            "serviceKey": self.service_key,
-            "resultType": "json",
-            "numOfRows": str(PAGE_SIZE),
-            "pageNo": str(page_no),
-            "basDt": bas_dt,
-        }
-        response = self.session.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        payload = response.json()
-        body = payload.get("response", {}).get("body", {})
-        return body if isinstance(body, dict) else {}
+    # 3) 120 day SMA (if exists)
+    d_sma = sma_last(df["Close"], SMA_N)
+    if d_sma is not None:
+        return close > float(d_sma)
 
-    def find_latest_bas_dt(self) -> str:
-        today = date.today()
-        for i in range(MAX_BACKTRACK_DAYS + 1):
-            bas_dt = (today - timedelta(days=i)).strftime("%Y%m%d")
-            body = self.request_page(bas_dt=bas_dt, page_no=1)
-            total_count = to_int(body.get("totalCount"), 0)
-            items = body.get("items", {}).get("item", [])
-            has_items = isinstance(items, dict) or (isinstance(items, list) and len(items) > 0)
-            if total_count > 0 and has_items:
-                return bas_dt
-        raise RuntimeError("No recent available trading date found.")
-
-    def iter_snapshot_items(self, bas_dt: str) -> Iterator[Dict[str, object]]:
-        first = self.request_page(bas_dt=bas_dt, page_no=1)
-        total_count = to_int(first.get("totalCount"), 0)
-        total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
-
-        yield from self._extract_items(first)
-
-        for page_no in range(2, total_pages + 1):
-            body = self.request_page(bas_dt=bas_dt, page_no=page_no)
-            yield from self._extract_items(body)
-
-    @staticmethod
-    def _extract_items(body: Dict[str, object]) -> Iterator[Dict[str, object]]:
-        items = body.get("items", {}).get("item", [])
-        if isinstance(items, dict):
-            yield items
-            return
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    yield item
-
-
-def passes_stage1(item: Dict[str, object]) -> bool:
-    # (Optional) name-based excludes (works only if itmsNm exists)
-    name = str(item.get("itmsNm", "")).strip().lower()
-
-    # SPAC exclude
-    if "스팩" in name or "spac" in name:
-        return False
-
-    # ETF exclude (+ common leveraged/inverse keywords)
-    if "etf" in name or "레버리지" in name or "인버스" in name:
-        return False
-
-    # Close price filter
-    close = first_available(item, ["clpr", "close", "stckClpr"])
-    if close < MIN_PRICE or close >= MAX_PRICE:
-        return False
-
-    # High price filter (<= 200,000)
-    high = first_available(item, ["hgpr", "high", "stckHgpr"])
-    if high > MAX_HIGH_PRICE:
-        return False
-
-    # Volume filter (>= 50,000)
-    volume = first_available(item, ["trqu", "accTrdVol", "volume"])
-    if volume < MIN_VOLUME:
-        return False
-
-    # Trade value filter (>= 50억); fallback close * volume
-    trade_value = first_available(item, ["trPrc", "accTrdVal", "tradeValue"])
-    if trade_value <= 0:
-        trade_value = close * volume
-    if trade_value < MIN_DAILY_TRADE_VALUE:
-        return False
-
-    # Halt / management / investment caution exclude (only if such fields exist)
-    flag_groups: List[List[str]] = [
-        ["haltYn", "trhtYn", "isTradingHalt"],
-        ["mgtIssueYn", "admYn", "isManagementIssue"],
-        ["invstCautnYn", "investCautionYn", "isInvestmentCaution"],
-    ]
-    for group in flag_groups:
-        existing = [key for key in group if key in item]
-        if not existing:
-            continue
-        if any(is_flagged(item.get(key)) for key in existing):
-            return False
-
+    # if no 120 data at all -> pass
     return True
 
 
 def main() -> int:
-    service_key = os.getenv("DATA_GO_KR_SERVICE_KEY", "").strip()
-    if not service_key:
-        print("ERROR: DATA_GO_KR_SERVICE_KEY is not set.", file=sys.stderr)
-        return 1
+    # Read codes from STDIN (one per line)
+    codes = []
+    for line in sys.stdin:
+        c = line.strip()
+        if c:
+            codes.append(c.zfill(6))
 
-    client = KRXClient(service_key)
+    if not codes:
+        print("PASSED: 0")
+        return 0
 
-    try:
-        bas_dt = client.find_latest_bas_dt()
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    start = (datetime.today() - timedelta(days=365 * 15)).strftime("%Y-%m-%d")
 
-    total = 0
-    try:
-        for item in client.iter_snapshot_items(bas_dt):
-            if not passes_stage1(item):
+    passed = 0
+    for code in codes:
+        try:
+            df = fdr.DataReader(code, start)
+            if df is None or df.empty or "Close" not in df.columns:
                 continue
-            code = str(item.get("srtnCd", "")).strip()
-            if not code:
-                continue
-            print(code.zfill(6))
-            total += 1
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+            df = df.copy()
+            df.index = pd.to_datetime(df.index)
 
-    print(f"TOTAL_COUNT={total}")
+            if decide(df):
+                print(code)
+                passed += 1
+        except Exception:
+            continue
+
+    print(f"PASSED: {passed}")
     return 0
 
 
