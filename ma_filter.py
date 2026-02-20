@@ -54,10 +54,16 @@ def read_codes_from_stdin() -> list[str]:
         c = line.strip()
         if not c:
             continue
-        # TOTAL_COUNT= 같은 요약 라인은 무시
-        if c.startswith("TOTAL_COUNT="):
+
+        # 숫자만 남기기: '005930' 또는 '5930' 같은 경우만 허용
+        # 'TOTAL_COUNT=..', 'PASSED: ..', 에러문, 경로 등은 전부 버림
+        if not c.replace(" ", "").isdigit():
             continue
-        # 6자리로 정규화
+
+        c = c.replace(" ", "")
+        if len(c) > 6:
+            continue
+
         codes.append(c.zfill(6))
     return codes
 
