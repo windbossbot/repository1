@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sys
 from typing import Iterable, List, Optional, Tuple
 
@@ -41,23 +40,73 @@ def fetch_ohlcv(code: str) -> Optional[pd.DataFrame]:
 def last_sma120(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
     if series.empty:
         return None, None
-    sma = series.rolling(window=120, min_periods=120).mean()
     last_close = float(series.iloc[-1])
-    last_sma = sma.iloc[-1]
-    if pd.isna(last_sma) or math.isnan(float(last_sma)):
+    if len(series) < 120:
         return last_close, None
-    return last_close, float(last_sma)
+    last_sma = float(series.tail(120).mean())
+    return last_close, last_sma
+
+
+def last_sma60(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
+    if series.empty:
+        return None, None
+    last_close = float(series.iloc[-1])
+    if len(series) < 60:
+        return last_close, None
+    last_sma = float(series.tail(60).mean())
+    return last_close, last_sma
+
+
+def monthly_jump_ratio(close_monthly: pd.Series, offset: int = 0) -> Optional[float]:
+    if len(close_monthly) < 2:
+        return None
+    idx_curr = -1 - offset
+    idx_prev = -2 - offset
+    if abs(idx_prev) > len(close_monthly):
+        return None
+
+    prev_close = float(close_monthly.iloc[idx_prev])
+    curr_close = float(close_monthly.iloc[idx_curr])
+    if prev_close <= 0:
+        return None
+    return (curr_close - prev_close) / prev_close
 
 
 def decide_pass(df: pd.DataFrame) -> Tuple[bool, str]:
     close_daily = df["Close"].astype(float)
 
+    # Analyze monthly first for faster early exclusions.
     close_monthly = close_daily.resample("ME").last().dropna()
-    monthly_close, monthly_sma = last_sma120(close_monthly)
-    if monthly_sma is not None and monthly_close is not None:
-        return monthly_close > monthly_sma, "M"
+
+    # Additional hard exclusions requested.
+    # - Monthly candles below 60: skip.
+    # - Latest monthly gain > 40%: skip.
+    # - Previous-month gain > 300%: skip.
+    if len(close_monthly) < 60:
+        return False, "M"
+    monthly_jump = monthly_jump_ratio(close_monthly, offset=0)
+    if monthly_jump is not None and monthly_jump > 0.40:
+        return False, "M"
+    prev_monthly_jump = monthly_jump_ratio(close_monthly, offset=1)
+    if prev_monthly_jump is not None and prev_monthly_jump > 3.00:
+        return False, "M"
+
+    monthly_close, monthly_sma60 = last_sma60(close_monthly)
+    if monthly_sma60 is not None and monthly_close is not None and monthly_close < monthly_sma60:
+        return False, "M"
+
+    monthly_close_120, monthly_sma120 = last_sma120(close_monthly)
+    if monthly_sma120 is not None and monthly_close_120 is not None:
+        return monthly_close_120 > monthly_sma120, "M"
 
     close_weekly = close_daily.resample("W-FRI").last().dropna()
+    if len(close_weekly) < 60:
+        return False, "W"
+
+    weekly_close, weekly_sma60 = last_sma60(close_weekly)
+    if weekly_sma60 is not None and weekly_close is not None and weekly_close < weekly_sma60:
+        return False, "W"
+
     weekly_close, weekly_sma = last_sma120(close_weekly)
     if weekly_sma is not None and weekly_close is not None:
         return weekly_close > weekly_sma, "W"
