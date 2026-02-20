@@ -92,10 +92,15 @@ def decide_pass(df: pd.DataFrame) -> Tuple[bool, str]:
         return False, "M"
 
     monthly_close, monthly_sma60 = last_sma60(close_monthly)
+    monthly_close_120, monthly_sma120 = last_sma120(close_monthly)
+
+    # Exclude when monthly 60MA is below monthly 120MA.
+    if monthly_sma60 is not None and monthly_sma120 is not None and monthly_sma60 < monthly_sma120:
+        return False, "M"
+
     if monthly_sma60 is not None and monthly_close is not None and monthly_close < monthly_sma60:
         return False, "M"
 
-    monthly_close_120, monthly_sma120 = last_sma120(close_monthly)
     if monthly_sma120 is not None and monthly_close_120 is not None:
         return monthly_close_120 > monthly_sma120, "M"
 
