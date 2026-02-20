@@ -12,8 +12,12 @@ REQUEST_TIMEOUT = 20
 PAGE_SIZE = 1000
 MAX_BACKTRACK_DAYS = 20
 
-MAX_PRICE = 300_000
-MIN_DAILY_TRADE_VALUE = 3_000_000_000
+# Filters (user requested)
+MAX_PRICE = 300_000                 # close < 300,000
+MIN_PRICE = 500                     # close >= 500
+MAX_HIGH_PRICE = 200_000            # high <= 200,000
+MIN_VOLUME = 50_000                 # volume >= 50,000
+MIN_DAILY_TRADE_VALUE = 5_000_000_000  # 50억
 
 
 def to_int(value: object, default: int = 0) -> int:
@@ -99,39 +103,45 @@ class KRXClient:
 
 
 def passes_stage1(item: Dict[str, object]) -> bool:
-    # 종목명 기반 제외 (SPAC / ETF 등)
+    # (Optional) name-based excludes (works only if itmsNm exists)
     name = str(item.get("itmsNm", "")).strip().lower()
 
-    # SPAC 제외
+    # SPAC exclude
     if "스팩" in name or "spac" in name:
         return False
 
-    # ETF 및 레버리지/인버스 제외
+    # ETF exclude (+ common leveraged/inverse keywords)
     if "etf" in name or "레버리지" in name or "인버스" in name:
         return False
 
-    # 가격 조건
+    # Close price filter
     close = first_available(item, ["clpr", "close", "stckClpr"])
-    if close < 500 or close >= MAX_PRICE:
+    if close < MIN_PRICE or close >= MAX_PRICE:
         return False
 
-    # 거래량 / 거래대금
-    volume = first_available(item, ["trqu", "accTrdVol", "volume"])
-    trade_value = first_available(item, ["trPrc", "accTrdVal", "tradeValue"])
+    # High price filter (<= 200,000)
+    high = first_available(item, ["hgpr", "high", "stckHgpr"])
+    if high > MAX_HIGH_PRICE:
+        return False
 
+    # Volume filter (>= 50,000)
+    volume = first_available(item, ["trqu", "accTrdVol", "volume"])
+    if volume < MIN_VOLUME:
+        return False
+
+    # Trade value filter (>= 50억); fallback close * volume
+    trade_value = first_available(item, ["trPrc", "accTrdVal", "tradeValue"])
     if trade_value <= 0:
         trade_value = close * volume
-
     if trade_value < MIN_DAILY_TRADE_VALUE:
         return False
 
-    # 거래정지 / 관리종목 / 투자주의 제외 (필드 존재 시)
+    # Halt / management / investment caution exclude (only if such fields exist)
     flag_groups: List[List[str]] = [
         ["haltYn", "trhtYn", "isTradingHalt"],
         ["mgtIssueYn", "admYn", "isManagementIssue"],
         ["invstCautnYn", "investCautionYn", "isInvestmentCaution"],
     ]
-
     for group in flag_groups:
         existing = [key for key in group if key in item]
         if not existing:
